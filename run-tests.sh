@@ -25,6 +25,8 @@ curl -o- https://raw.githubusercontent.com/creationix/nvm/v0.33.4/install.sh | b
 set -ex
 cd $ROOT
 
+git submodule update --init --recursive
+
 if [ ! -n "$node_versions" ] ; then
   node_versions="8 10 12"
 fi
@@ -44,6 +46,7 @@ export JOBS=8
 export JUNIT_REPORT_STACK=1
 
 OS=$(uname)
+ARCH=$(uname -m)
 
 # TODO(mlumish): Add electron tests
 
@@ -68,7 +71,6 @@ do
   node -e 'process.exit(process.version.startsWith("v'$version'") ? 0 : -1)'
 
   # Install dependencies and link packages together.
-  ./node_modules/.bin/gulp cleanAll
   ./node_modules/.bin/gulp setup
 
   # npm test calls nyc gulp test
@@ -85,7 +87,7 @@ if [ "$FAILED" = "true" ]
 then
   exit 1
 else
-  if [ "$OS" = "Linux" ]
+  if [ "$OS" = "Linux" ] && [ "$ARCH" != "aarch64"]
   then
     # If we can't download the token file, just skip reporting coverage
     gsutil cp gs://grpc-testing-secrets/coveralls_credentials/grpc-node.rc /tmp || exit 0

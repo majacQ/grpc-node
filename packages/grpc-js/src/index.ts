@@ -15,8 +15,6 @@
  *
  */
 
-import * as semver from 'semver';
-
 import {
   ClientDuplexStream,
   ClientReadableStream,
@@ -57,18 +55,15 @@ import { StatusBuilder } from './status-builder';
 import {
   handleBidiStreamingCall,
   handleServerStreamingCall,
+  handleClientStreamingCall,
   handleUnaryCall,
   sendUnaryData,
   ServerUnaryCall,
   ServerReadableStream,
   ServerWritableStream,
   ServerDuplexStream,
+  ServerErrorResponse,
 } from './server-call';
-
-const supportedNodeVersions = require('../../package.json').engines.node;
-if (!semver.satisfies(process.version, supportedNodeVersions)) {
-  throw new Error(`@grpc/grpc-js only works on Node ${supportedNodeVersions}`);
-}
 
 export { OAuth2Client };
 
@@ -179,6 +174,7 @@ export {
   ServerReadableStream,
   ServerWritableStream,
   ServerDuplexStream,
+  ServerErrorResponse,
   ServiceDefinition,
   UntypedHandleCall,
   UntypedServiceImplementation,
@@ -186,7 +182,7 @@ export {
 
 /**** Server ****/
 
-export { handleBidiStreamingCall, handleServerStreamingCall, handleUnaryCall };
+export { handleBidiStreamingCall, handleServerStreamingCall, handleUnaryCall, handleClientStreamingCall };
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type Call =
@@ -244,6 +240,11 @@ export {
 } from './client-interceptors';
 
 export { GrpcObject } from './make-client';
+
+export { ChannelOptions } from './channel-options';
+
+import * as experimental from './experimental';
+export { experimental };
 
 import * as resolver from './resolver';
 import * as load_balancer from './load-balancer';
