@@ -35,6 +35,7 @@ import { Metadata } from './metadata';
 import * as logging from './logging';
 import { LogVerbosity } from './constants';
 import { SubchannelAddress } from './subchannel';
+import { GrpcUri, uriToString } from './uri-parser';
 
 const TRACER_NAME = 'resolving_load_balancer';
 
@@ -126,7 +127,7 @@ export class ResolvingLoadBalancer implements LoadBalancer {
    *     implmentation
    */
   constructor(
-    private target: string,
+    private target: GrpcUri,
     private channelControlHelper: ChannelControlHelper,
     private defaultServiceConfig: ServiceConfig | null
   ) {
@@ -135,7 +136,8 @@ export class ResolvingLoadBalancer implements LoadBalancer {
       onSuccessfulResolution: (
         addressList: SubchannelAddress[],
         serviceConfig: ServiceConfig | null,
-        serviceConfigError: ServiceError | null
+        serviceConfigError: ServiceError | null,
+        attributes: { [key: string]: unknown }
       ) => {
         let workingServiceConfig: ServiceConfig | null = null;
         /* This first group of conditionals implements the algorithm described
@@ -210,12 +212,14 @@ export class ResolvingLoadBalancer implements LoadBalancer {
           )!;
           this.innerLoadBalancer.updateAddressList(
             addressList,
-            loadBalancingConfig
+            loadBalancingConfig,
+            attributes
           );
         } else if (this.innerLoadBalancer.getTypeName() === loadBalancerName) {
           this.innerLoadBalancer.updateAddressList(
             addressList,
-            loadBalancingConfig
+            loadBalancingConfig,
+            attributes
           );
         } else {
           if (
@@ -233,7 +237,8 @@ export class ResolvingLoadBalancer implements LoadBalancer {
           }
           this.pendingReplacementLoadBalancer.updateAddressList(
             addressList,
-            loadBalancingConfig
+            loadBalancingConfig,
+            attributes
           );
         }
       },
@@ -352,7 +357,7 @@ export class ResolvingLoadBalancer implements LoadBalancer {
 
   private updateState(connectivitystate: ConnectivityState, picker: Picker) {
     trace(
-      this.target +
+      uriToString(this.target) +
         ' ' +
         ConnectivityState[this.currentState] +
         ' -> ' +

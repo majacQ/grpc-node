@@ -65,6 +65,8 @@ class PickFirstPicker implements Picker {
       pickResultType: PickResultType.COMPLETE,
       subchannel: this.subchannel,
       status: null,
+      extraFilterFactory: null,
+      onCallStarted: null,
     };
   }
 }
@@ -338,11 +340,11 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     this.resetSubchannelList();
     trace(
       'Connect to address list ' +
-        this.latestAddressList.map(address =>
+        this.latestAddressList.map((address) =>
           subchannelAddressToString(address)
         )
     );
-    this.subchannels = this.latestAddressList.map(address =>
+    this.subchannels = this.latestAddressList.map((address) =>
       this.channelControlHelper.createSubchannel(address, {})
     );
     for (const subchannel of this.subchannels) {
@@ -350,6 +352,7 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     }
     for (const subchannel of this.subchannels) {
       subchannel.addConnectivityStateListener(this.subchannelStateListener);
+      this.subchannelStateCounts[subchannel.getConnectivityState()] += 1;
       if (subchannel.getConnectivityState() === ConnectivityState.READY) {
         this.pickSubchannel(subchannel);
         this.resetSubchannelList();
