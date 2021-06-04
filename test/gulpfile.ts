@@ -25,49 +25,37 @@ import * as semver from 'semver';
 const testDir = __dirname;
 const apiTestDir = path.resolve(testDir, 'api');
 
-const install = () => {
+const runInstall = () => {
   return execa('npm', ['install'], {cwd: testDir, stdio: 'inherit'});
 };
 
+const runRebuild = () => execa('npm', ['rebuild', '--unsafe-perm'], {cwd: testDir, stdio: 'inherit'});
+
+const install = gulp.series(runInstall, runRebuild);
+
 const cleanAll = () => Promise.resolve();
 
-const test = () => {
-  // run mocha tests matching a glob with a pre-required fixture,
-  // returning the associated gulp stream
-  if (!semver.satisfies(process.version, '>=10.10.0')) {
-    console.log(`Skipping cross-implementation tests for Node ${process.version}`);
-    return Promise.resolve();
-  }
-  const apiTestGlob = `${apiTestDir}/*.js`;
-  const runTestsWithFixture = (server, client) => new Promise((resolve, reject) => {
-    const fixture = `${server}_${client}`;
-    console.log(`Running ${apiTestGlob} with ${server} server + ${client} client`);
-    gulp.src(apiTestGlob)
-      .pipe(mocha({
-        reporter: 'mocha-jenkins-reporter',
-        require: [`${testDir}/fixtures/${fixture}.js`]
-      }))
-      .resume() // put the stream in flowing mode
-      .on('end', resolve)
-      .on('error', reject);
-  });
-  var runTestsArgPairs;
-  if (semver.satisfies(process.version, '^8.13.0 || >=10.10.0')) {
-    runTestsArgPairs = [
-      ['native', 'native'],
-      ['native', 'js'],
-      ['js', 'native'],
-      ['js', 'js']
-    ];
-  } else {
-    runTestsArgPairs = [
-      ['native', 'native']
-    ];
-  }
-  return runTestsArgPairs.reduce((previousPromise, argPair) => {
-    return previousPromise.then(runTestsWithFixture.bind(null, argPair[0], argPair[1]));
-  }, Promise.resolve());
-};
+const runTestsWithFixture = (server, client) => () => new Promise((resolve, reject) => {
+  const fixture = `${server}_${client}`;
+  gulp.src(`${apiTestDir}/*.js`)
+    .pipe(mocha({
+      reporter: 'mocha-jenkins-reporter',
+      require: [`${testDir}/fixtures/${fixture}.js`]
+    }))
+    .resume() // put the stream in flowing mode
+    .on('end', resolve)
+    .on('error', reject);
+});
+
+const testJsClientNativeServer = runTestsWithFixture('native', 'js');
+const testNativeClientJsServer = runTestsWithFixture('js', 'native');
+const testJsClientJsServer = runTestsWithFixture('js', 'js');
+
+const test = gulp.series(
+               testJsClientNativeServer,
+               testNativeClientJsServer,
+               testJsClientJsServer
+              );
 
 export {
   install,

@@ -30,7 +30,12 @@ import {
   UnavailablePicker,
 } from './picker';
 import { LoadBalancingConfig } from './load-balancing-config';
-import { Subchannel, ConnectivityStateListener } from './subchannel';
+import {
+  Subchannel,
+  ConnectivityStateListener,
+  SubchannelAddress,
+  subchannelAddressToString,
+} from './subchannel';
 import * as logging from './logging';
 import { LogVerbosity } from './constants';
 
@@ -60,23 +65,25 @@ class PickFirstPicker implements Picker {
       pickResultType: PickResultType.COMPLETE,
       subchannel: this.subchannel,
       status: null,
+      extraFilterFactory: null,
+      onCallStarted: null,
     };
   }
 }
 
 interface ConnectivityStateCounts {
-  [ConnectivityState.CONNECTING]: number,
-  [ConnectivityState.IDLE]: number,
-  [ConnectivityState.READY]: number,
-  [ConnectivityState.SHUTDOWN]: number,
-  [ConnectivityState.TRANSIENT_FAILURE]: number
+  [ConnectivityState.CONNECTING]: number;
+  [ConnectivityState.IDLE]: number;
+  [ConnectivityState.READY]: number;
+  [ConnectivityState.SHUTDOWN]: number;
+  [ConnectivityState.TRANSIENT_FAILURE]: number;
 }
 
 export class PickFirstLoadBalancer implements LoadBalancer {
   /**
    * The list of backend addresses most recently passed to `updateAddressList`.
    */
-  private latestAddressList: string[] = [];
+  private latestAddressList: SubchannelAddress[] = [];
   /**
    * The list of subchannels this load balancer is currently attempting to
    * connect to.
@@ -122,14 +129,13 @@ export class PickFirstLoadBalancer implements LoadBalancer {
    * @param channelControlHelper `ChannelControlHelper` instance provided by
    *     this load balancer's owner.
    */
-  constructor(private channelControlHelper: ChannelControlHelper) {
-    this.updateState(ConnectivityState.IDLE, new QueuePicker(this));
+  constructor(private readonly channelControlHelper: ChannelControlHelper) {
     this.subchannelStateCounts = {
       [ConnectivityState.CONNECTING]: 0,
       [ConnectivityState.IDLE]: 0,
       [ConnectivityState.READY]: 0,
       [ConnectivityState.SHUTDOWN]: 0,
-      [ConnectivityState.TRANSIENT_FAILURE]: 0
+      [ConnectivityState.TRANSIENT_FAILURE]: 0,
     };
     this.subchannelStateListener = (
       subchannel: Subchannel,
@@ -152,18 +158,27 @@ export class PickFirstLoadBalancer implements LoadBalancer {
         this.pickSubchannel(subchannel);
         return;
       } else {
-        if (this.triedAllSubchannels && this.subchannelStateCounts[ConnectivityState.IDLE] === this.subchannels.length) {
+        if (
+          this.triedAllSubchannels &&
+          this.subchannelStateCounts[ConnectivityState.IDLE] ===
+            this.subchannels.length
+        ) {
           /* If all of the subchannels are IDLE we should go back to a
            * basic IDLE state where there is no subchannel list to avoid
            * holding unused resources */
           this.resetSubchannelList();
+          this.updateState(ConnectivityState.IDLE, new QueuePicker(this));
+          return;
         }
         if (this.currentPick === null) {
           if (this.triedAllSubchannels) {
             let newLBState: ConnectivityState;
             if (this.subchannelStateCounts[ConnectivityState.CONNECTING] > 0) {
               newLBState = ConnectivityState.CONNECTING;
-            } else if (this.subchannelStateCounts[ConnectivityState.TRANSIENT_FAILURE] > 0) {
+            } else if (
+              this.subchannelStateCounts[ConnectivityState.TRANSIENT_FAILURE] >
+              0
+            ) {
               newLBState = ConnectivityState.TRANSIENT_FAILURE;
             } else {
               newLBState = ConnectivityState.IDLE;
@@ -200,7 +215,10 @@ export class PickFirstLoadBalancer implements LoadBalancer {
             let newLBState: ConnectivityState;
             if (this.subchannelStateCounts[ConnectivityState.CONNECTING] > 0) {
               newLBState = ConnectivityState.CONNECTING;
-            } else if (this.subchannelStateCounts[ConnectivityState.TRANSIENT_FAILURE] > 0) {
+            } else if (
+              this.subchannelStateCounts[ConnectivityState.TRANSIENT_FAILURE] >
+              0
+            ) {
               newLBState = ConnectivityState.TRANSIENT_FAILURE;
             } else {
               newLBState = ConnectivityState.IDLE;
@@ -259,7 +277,10 @@ export class PickFirstLoadBalancer implements LoadBalancer {
       this.subchannels[subchannelIndex].getConnectivityState() ===
       ConnectivityState.IDLE
     ) {
-      trace('Start connecting to subchannel with address ' + this.subchannels[subchannelIndex].getAddress());
+      trace(
+        'Start connecting to subchannel with address ' +
+          this.subchannels[subchannelIndex].getAddress()
+      );
       process.nextTick(() => {
         this.subchannels[subchannelIndex].startConnecting();
       });
@@ -286,7 +307,11 @@ export class PickFirstLoadBalancer implements LoadBalancer {
   }
 
   private updateState(newState: ConnectivityState, picker: Picker) {
-    trace(ConnectivityState[this.currentState] + ' -> ' + ConnectivityState[newState]);
+    trace(
+      ConnectivityState[this.currentState] +
+        ' -> ' +
+        ConnectivityState[newState]
+    );
     this.currentState = newState;
     this.channelControlHelper.updateState(newState, picker);
   }
@@ -302,7 +327,7 @@ export class PickFirstLoadBalancer implements LoadBalancer {
       [ConnectivityState.IDLE]: 0,
       [ConnectivityState.READY]: 0,
       [ConnectivityState.SHUTDOWN]: 0,
-      [ConnectivityState.TRANSIENT_FAILURE]: 0
+      [ConnectivityState.TRANSIENT_FAILURE]: 0,
     };
     this.subchannels = [];
     this.triedAllSubchannels = false;
@@ -314,8 +339,13 @@ export class PickFirstLoadBalancer implements LoadBalancer {
    */
   private connectToAddressList(): void {
     this.resetSubchannelList();
-    trace('Connect to address list ' + this.latestAddressList);
-    this.subchannels = this.latestAddressList.map(address =>
+    trace(
+      'Connect to address list ' +
+        this.latestAddressList.map((address) =>
+          subchannelAddressToString(address)
+        )
+    );
+    this.subchannels = this.latestAddressList.map((address) =>
       this.channelControlHelper.createSubchannel(address, {})
     );
     for (const subchannel of this.subchannels) {
@@ -323,6 +353,7 @@ export class PickFirstLoadBalancer implements LoadBalancer {
     }
     for (const subchannel of this.subchannels) {
       subchannel.addConnectivityStateListener(this.subchannelStateListener);
+      this.subchannelStateCounts[subchannel.getConnectivityState()] += 1;
       if (subchannel.getConnectivityState() === ConnectivityState.READY) {
         this.pickSubchannel(subchannel);
         this.resetSubchannelList();
@@ -352,14 +383,19 @@ export class PickFirstLoadBalancer implements LoadBalancer {
   }
 
   updateAddressList(
-    addressList: string[],
-    lbConfig: LoadBalancingConfig | null
+    addressList: SubchannelAddress[],
+    lbConfig: LoadBalancingConfig
   ): void {
     // lbConfig has no useful information for pick first load balancing
     /* To avoid unnecessary churn, we only do something with this address list
      * if we're not currently trying to establish a connection, or if the new
      * address list is different from the existing one */
-    if (this.subchannels.length === 0 || !this.latestAddressList.every((value, index) => addressList[index] === value)) {
+    if (
+      this.subchannels.length === 0 ||
+      !this.latestAddressList.every(
+        (value, index) => addressList[index] === value
+      )
+    ) {
       this.latestAddressList = addressList;
       this.connectToAddressList();
     }
@@ -374,7 +410,10 @@ export class PickFirstLoadBalancer implements LoadBalancer {
         this.connectToAddressList();
       }
     }
-    if (this.currentState === ConnectivityState.IDLE || this.triedAllSubchannels) {
+    if (
+      this.currentState === ConnectivityState.IDLE ||
+      this.triedAllSubchannels
+    ) {
       this.channelControlHelper.requestReresolution();
     }
   }
@@ -396,10 +435,6 @@ export class PickFirstLoadBalancer implements LoadBalancer {
 
   getTypeName(): string {
     return TYPE_NAME;
-  }
-
-  replaceChannelControlHelper(channelControlHelper: ChannelControlHelper) {
-    this.channelControlHelper = channelControlHelper;
   }
 }
 

@@ -16,8 +16,13 @@
  */
 
 import { ChannelOptions, channelOptionsEqual } from './channel-options';
-import { Subchannel } from './subchannel';
+import {
+  Subchannel,
+  SubchannelAddress,
+  subchannelAddressEqual,
+} from './subchannel';
 import { ChannelCredentials } from './channel-credentials';
+import { GrpcUri, uriToString } from './uri-parser';
 
 // 10 seconds in milliseconds. This value is arbitrary.
 /**
@@ -28,14 +33,18 @@ const REF_CHECK_INTERVAL = 10_000;
 
 export class SubchannelPool {
   private pool: {
-    [channelTarget: string]: {
-      [subchannelTarget: string]: Array<{
-        channelArguments: ChannelOptions;
-        channelCredentials: ChannelCredentials;
-        subchannel: Subchannel;
-      }>;
-    };
+    [channelTarget: string]: Array<{
+      subchannelAddress: SubchannelAddress;
+      channelArguments: ChannelOptions;
+      channelCredentials: ChannelCredentials;
+      subchannel: Subchannel;
+    }>;
   } = Object.create(null);
+
+  /**
+   * A timer of a task performing a periodic subchannel cleanup.
+   */
+  private cleanupTimer: NodeJS.Timer | null = null;
 
   /**
    * A pool of subchannels use for making connections. Subchannels with the
@@ -43,33 +52,57 @@ export class SubchannelPool {
    * @param global If true, this is the global subchannel pool. Otherwise, it
    * is the pool for a single channel.
    */
-  constructor(private global: boolean) {
-    if (global) {
-      setInterval(() => {
-        /* These objects are created with Object.create(null), so they do not
-         * have a prototype, which means that for (... in ...) loops over them
-         * do not need to be filtered */
-        // tslint:disable-next-line:forin
-        for (const channelTarget in this.pool) {
-          // tslint:disable-next-line:forin
-          for (const subchannelTarget in this.pool[channelTarget]) {
-            const subchannelObjArray = this.pool[channelTarget][
-              subchannelTarget
-            ];
-            /* For each subchannel in the pool, try to unref it if it has
-             * exactly one ref (which is the ref from the pool itself). If that
-             * does happen, remove the subchannel from the pool */
-            this.pool[channelTarget][
-              subchannelTarget
-            ] = subchannelObjArray.filter(
-              value => !value.subchannel.unrefIfOneRef()
-            );
-          }
-        }
-        /* Currently we do not delete keys with empty values. If that results
-         * in significant memory usage we should change it. */
-      }, REF_CHECK_INTERVAL).unref();
-      // Unref because this timer should not keep the event loop running
+  constructor(private global: boolean) {}
+
+  /**
+   * Unrefs all unused subchannels and cancels the cleanup task if all
+   * subchannels have been unrefed.
+   */
+  unrefUnusedSubchannels(): void {
+    let allSubchannelsUnrefed = true;
+
+    /* These objects are created with Object.create(null), so they do not
+     * have a prototype, which means that for (... in ...) loops over them
+     * do not need to be filtered */
+    // eslint-disable-disable-next-line:forin
+    for (const channelTarget in this.pool) {
+      const subchannelObjArray = this.pool[channelTarget];
+
+      const refedSubchannels = subchannelObjArray.filter(
+        (value) => !value.subchannel.unrefIfOneRef()
+      );
+
+      if (refedSubchannels.length > 0) {
+        allSubchannelsUnrefed = false;
+      }
+
+      /* For each subchannel in the pool, try to unref it if it has
+       * exactly one ref (which is the ref from the pool itself). If that
+       * does happen, remove the subchannel from the pool */
+      this.pool[channelTarget] = refedSubchannels;
+    }
+    /* Currently we do not delete keys with empty values. If that results
+     * in significant memory usage we should change it. */
+
+    // Cancel the cleanup task if all subchannels have been unrefed.
+    if (allSubchannelsUnrefed && this.cleanupTimer !== null) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+  }
+
+  /**
+   * Ensures that the cleanup task is spawned.
+   */
+  ensureCleanupTask(): void {
+    if (this.global && this.cleanupTimer === null) {
+      this.cleanupTimer = setInterval(() => {
+        this.unrefUnusedSubchannels();
+      }, REF_CHECK_INTERVAL);
+
+      // Unref because this timer should not keep the event loop running.
+      // Call unref only if it exists to address electron/electron#21162
+      this.cleanupTimer.unref?.();
     }
   }
 
@@ -82,41 +115,43 @@ export class SubchannelPool {
    * @param channelCredentials
    */
   getOrCreateSubchannel(
-    channelTarget: string,
-    subchannelTarget: string,
+    channelTargetUri: GrpcUri,
+    subchannelTarget: SubchannelAddress,
     channelArguments: ChannelOptions,
     channelCredentials: ChannelCredentials
   ): Subchannel {
+    this.ensureCleanupTask();
+    const channelTarget = uriToString(channelTargetUri);
     if (channelTarget in this.pool) {
-      if (subchannelTarget in this.pool[channelTarget]) {
-        const subchannelObjArray = this.pool[channelTarget][subchannelTarget];
-        for (const subchannelObj of subchannelObjArray) {
-          if (
-            channelOptionsEqual(
-              channelArguments,
-              subchannelObj.channelArguments
-            ) &&
-            channelCredentials._equals(subchannelObj.channelCredentials)
-          ) {
-            return subchannelObj.subchannel;
-          }
+      const subchannelObjArray = this.pool[channelTarget];
+      for (const subchannelObj of subchannelObjArray) {
+        if (
+          subchannelAddressEqual(
+            subchannelTarget,
+            subchannelObj.subchannelAddress
+          ) &&
+          channelOptionsEqual(
+            channelArguments,
+            subchannelObj.channelArguments
+          ) &&
+          channelCredentials._equals(subchannelObj.channelCredentials)
+        ) {
+          return subchannelObj.subchannel;
         }
       }
     }
     // If we get here, no matching subchannel was found
     const subchannel = new Subchannel(
-      channelTarget,
+      channelTargetUri,
       subchannelTarget,
       channelArguments,
       channelCredentials
     );
     if (!(channelTarget in this.pool)) {
-      this.pool[channelTarget] = Object.create(null);
+      this.pool[channelTarget] = [];
     }
-    if (!(subchannelTarget in this.pool[channelTarget])) {
-      this.pool[channelTarget][subchannelTarget] = [];
-    }
-    this.pool[channelTarget][subchannelTarget].push({
+    this.pool[channelTarget].push({
+      subchannelAddress: subchannelTarget,
       channelArguments,
       channelCredentials,
       subchannel,

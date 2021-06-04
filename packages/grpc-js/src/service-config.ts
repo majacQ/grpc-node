@@ -24,7 +24,7 @@
 
 /* The any type is purposely used here. All functions validate their input at
  * runtime */
-/* tslint:disable:no-any */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 import * as lbconfig from './load-balancing-config';
 import * as os from 'os';
@@ -162,9 +162,7 @@ export function validateServiceConfig(obj: any): ServiceConfig {
           name.method === seenName.method
         ) {
           throw new Error(
-            `Invalid service config: duplicate name ${name.service}/${
-              name.method
-            }`
+            `Invalid service config: duplicate name ${name.service}/${name.method}`
           );
         }
       }

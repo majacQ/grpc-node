@@ -16,6 +16,8 @@
  */
 
 import * as http2 from 'http2';
+import { log } from './logging';
+import { LogVerbosity } from './constants';
 const LEGAL_KEY_REGEX = /^[0-9a-z_.-]+$/;
 const LEGAL_NON_BINARY_VALUE_REGEX = /^[ -~]*$/;
 
@@ -34,6 +36,10 @@ function isBinaryKey(key: string): boolean {
   return key.endsWith('-bin');
 }
 
+function isCustomMetadata(key: string): boolean {
+  return !key.startsWith('grpc-');
+}
+
 function normalizeKey(key: string): string {
   return key.toLowerCase();
 }
@@ -42,7 +48,7 @@ function validate(key: string, value?: MetadataValue): void {
   if (!isLegalKey(key)) {
     throw new Error('Metadata key "' + key + '" contains illegal characters');
   }
-  if (value != null) {
+  if (value !== null && value !== undefined) {
     if (isBinaryKey(key)) {
       if (!(value instanceof Buffer)) {
         throw new Error("keys that end with '-bin' must have Buffer values");
@@ -168,11 +174,11 @@ export class Metadata {
    * @return The newly cloned object.
    */
   clone(): Metadata {
-    const newMetadata = new Metadata();
+    const newMetadata = new Metadata(this.options);
     const newInternalRepr = newMetadata.internalRepr;
 
     this.internalRepr.forEach((value, key) => {
-      const clonedValue: MetadataValue[] = value.map(v => {
+      const clonedValue: MetadataValue[] = value.map((v) => {
         if (v instanceof Buffer) {
           return Buffer.from(v);
         } else {
@@ -220,7 +226,7 @@ export class Metadata {
     this.internalRepr.forEach((values, key) => {
       // We assume that the user's interaction with this object is limited to
       // through its public API (i.e. keys and values are already validated).
-      result[key] = values.map(value => {
+      result[key] = values.map((value) => {
         if (value instanceof Buffer) {
           return value.toString('base64');
         } else {
@@ -243,7 +249,7 @@ export class Metadata {
    */
   static fromHttp2Headers(headers: http2.IncomingHttpHeaders): Metadata {
     const result = new Metadata();
-    Object.keys(headers).forEach(key => {
+    Object.keys(headers).forEach((key) => {
       // Reserved headers (beginning with `:`) are not valid keys.
       if (key.charAt(0) === ':') {
         return;
@@ -254,26 +260,30 @@ export class Metadata {
       try {
         if (isBinaryKey(key)) {
           if (Array.isArray(values)) {
-            values.forEach(value => {
+            values.forEach((value) => {
               result.add(key, Buffer.from(value, 'base64'));
             });
           } else if (values !== undefined) {
-            values.split(',').forEach(v => {
-              result.add(key, Buffer.from(v.trim(), 'base64'));
-            });
+            if (isCustomMetadata(key)) {
+              values.split(',').forEach((v) => {
+                result.add(key, Buffer.from(v.trim(), 'base64'));
+              });
+            } else {
+              result.add(key, Buffer.from(values, 'base64'));
+            }
           }
         } else {
           if (Array.isArray(values)) {
-            values.forEach(value => {
+            values.forEach((value) => {
               result.add(key, value);
             });
           } else if (values !== undefined) {
-            values.split(',').forEach(v => result.add(key, v.trim()));
+            result.add(key, values);
           }
         }
       } catch (error) {
-        error.message = `Failed to add metadata entry ${key}: ${values}. ${error.message}`;
-        process.emitWarning(error);
+        const message = `Failed to add metadata entry ${key}: ${values}. ${error.message}. For more information see https://github.com/grpc/grpc-node/issues/1173`;
+        log(LogVerbosity.ERROR, message);
       }
     });
     return result;

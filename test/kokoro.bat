@@ -17,7 +17,4 @@
 cd /d %~dp0
 cd ..
 
-git submodule update --init
-git submodule foreach --recursive git submodule update --init
-
 .\run-tests.bat

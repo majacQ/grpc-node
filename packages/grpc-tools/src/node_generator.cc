@@ -181,7 +181,7 @@ void PrintMethod(const MethodDescriptor* method, Printer* out) {
 void PrintService(const ServiceDescriptor* service, Printer* out,
                   const Parameters& params) {
   map<grpc::string, grpc::string> template_vars;
-  out->Print(GetNodeComments(service, true).c_str());
+  out->PrintRaw(GetNodeComments(service, true).c_str());
   template_vars["name"] = service->name();
   template_vars["full_name"] = service->full_name();
   if (params.generate_package_definition) {
@@ -193,11 +193,11 @@ void PrintService(const ServiceDescriptor* service, Printer* out,
   for (int i = 0; i < service->method_count(); i++) {
     grpc::string method_name =
         grpc_generator::LowercaseFirstLetter(service->method(i)->name());
-    out->Print(GetNodeComments(service->method(i), true).c_str());
+    out->PrintRaw(GetNodeComments(service->method(i), true).c_str());
     out->Print("$method_name$: ", "method_name", method_name);
     PrintMethod(service->method(i), out);
     out->Print(",\n");
-    out->Print(GetNodeComments(service->method(i), false).c_str());
+    out->PrintRaw(GetNodeComments(service->method(i), false).c_str());
   }
   out->Outdent();
   out->Print("};\n\n");
@@ -206,13 +206,14 @@ void PrintService(const ServiceDescriptor* service, Printer* out,
                "exports.$name$Client = "
                "grpc.makeGenericClientConstructor($name$Service);\n");
   }
-  out->Print(GetNodeComments(service, false).c_str());
+  out->PrintRaw(GetNodeComments(service, false).c_str());
 }
 
 void PrintImports(const FileDescriptor* file, Printer* out,
                   const Parameters& params) {
   if (!params.generate_package_definition) {
-    out->Print("var grpc = require('grpc');\n");
+    grpc::string package = params.grpc_js ? "@grpc/grpc-js" : "grpc";
+    out->Print("var grpc = require('$package$');\n", "package", package);
   }
   if (file->message_type_count() > 0) {
     grpc::string file_path =
@@ -276,7 +277,7 @@ grpc::string GenerateFile(const FileDescriptor* file,
 
     PrintServices(file, &out, params);
 
-    out.Print(GetNodeComments(file, false).c_str());
+    out.PrintRaw(GetNodeComments(file, false).c_str());
   }
   return output;
 }
