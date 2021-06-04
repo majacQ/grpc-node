@@ -120,8 +120,7 @@ grpc::string NodeObjectPath(const Descriptor* descriptor) {
 }
 
 // Prints out the message serializer and deserializer functions
-void PrintMessageTransformer(const Descriptor* descriptor, Printer* out,
-                             const Parameters& params) {
+void PrintMessageTransformer(const Descriptor* descriptor, Printer* out) {
   map<grpc::string, grpc::string> template_vars;
   grpc::string full_name = descriptor->full_name();
   template_vars["identifier_name"] = MessageIdentifierName(full_name);
@@ -136,12 +135,7 @@ void PrintMessageTransformer(const Descriptor* descriptor, Printer* out,
              "throw new Error('Expected argument of type $name$');\n");
   out->Outdent();
   out->Print("}\n");
-  if (params.minimum_node_version > 5) {
-    // Node version is > 5, we should use Buffer.from
-    out->Print("return Buffer.from(arg.serializeBinary());\n");
-  } else {
-    out->Print("return new Buffer(arg.serializeBinary());\n");
-  }
+  out->Print("return Buffer.from(arg.serializeBinary());\n");
   out->Outdent();
   out->Print("}\n\n");
 
@@ -184,31 +178,43 @@ void PrintMethod(const MethodDescriptor* method, Printer* out) {
 }
 
 // Prints out the service descriptor object
-void PrintService(const ServiceDescriptor* service, Printer* out) {
+void PrintService(const ServiceDescriptor* service, Printer* out,
+                  const Parameters& params) {
   map<grpc::string, grpc::string> template_vars;
-  out->Print(GetNodeComments(service, true).c_str());
+  out->PrintRaw(GetNodeComments(service, true).c_str());
   template_vars["name"] = service->name();
-  out->Print(template_vars, "var $name$Service = exports.$name$Service = {\n");
+  template_vars["full_name"] = service->full_name();
+  if (params.generate_package_definition) {
+    out->Print(template_vars, "var $name$Service = exports['$full_name$'] = {\n");
+  } else {
+    out->Print(template_vars, "var $name$Service = exports.$name$Service = {\n");
+  }
   out->Indent();
   for (int i = 0; i < service->method_count(); i++) {
     grpc::string method_name =
         grpc_generator::LowercaseFirstLetter(service->method(i)->name());
-    out->Print(GetNodeComments(service->method(i), true).c_str());
+    out->PrintRaw(GetNodeComments(service->method(i), true).c_str());
     out->Print("$method_name$: ", "method_name", method_name);
     PrintMethod(service->method(i), out);
     out->Print(",\n");
-    out->Print(GetNodeComments(service->method(i), false).c_str());
+    out->PrintRaw(GetNodeComments(service->method(i), false).c_str());
   }
   out->Outdent();
   out->Print("};\n\n");
-  out->Print(template_vars,
-             "exports.$name$Client = "
-             "grpc.makeGenericClientConstructor($name$Service);\n");
-  out->Print(GetNodeComments(service, false).c_str());
+  if (!params.generate_package_definition) {
+    out->Print(template_vars,
+               "exports.$name$Client = "
+               "grpc.makeGenericClientConstructor($name$Service);\n");
+  }
+  out->PrintRaw(GetNodeComments(service, false).c_str());
 }
 
-void PrintImports(const FileDescriptor* file, Printer* out) {
-  out->Print("var grpc = require('grpc');\n");
+void PrintImports(const FileDescriptor* file, Printer* out,
+                  const Parameters& params) {
+  if (!params.generate_package_definition) {
+    grpc::string package = params.grpc_js ? "@grpc/grpc-js" : "grpc";
+    out->Print("var grpc = require('$package$');\n", "package", package);
+  }
   if (file->message_type_count() > 0) {
     grpc::string file_path =
         GetRelativePath(file->name(), GetJSMessageFilename(file->name()));
@@ -226,20 +232,20 @@ void PrintImports(const FileDescriptor* file, Printer* out) {
   out->Print("\n");
 }
 
-void PrintTransformers(const FileDescriptor* file, Printer* out,
-                       const Parameters& params) {
+void PrintTransformers(const FileDescriptor* file, Printer* out) {
   map<grpc::string, const Descriptor*> messages = GetAllMessages(file);
   for (std::map<grpc::string, const Descriptor*>::iterator it =
            messages.begin();
        it != messages.end(); it++) {
-    PrintMessageTransformer(it->second, out, params);
+    PrintMessageTransformer(it->second, out);
   }
   out->Print("\n");
 }
 
-void PrintServices(const FileDescriptor* file, Printer* out) {
+void PrintServices(const FileDescriptor* file, Printer* out,
+                   const Parameters& params) {
   for (int i = 0; i < file->service_count(); i++) {
-    PrintService(file->service(i), out);
+    PrintService(file->service(i), out, params);
   }
 }
 }  // namespace
@@ -252,6 +258,7 @@ grpc::string GenerateFile(const FileDescriptor* file,
     Printer out(&output_stream, '$');
 
     if (file->service_count() == 0) {
+      output = "// GENERATED CODE -- NO SERVICES IN PROTO";
       return output;
     }
     out.Print("// GENERATED CODE -- DO NOT EDIT!\n\n");
@@ -264,13 +271,13 @@ grpc::string GenerateFile(const FileDescriptor* file,
 
     out.Print("'use strict';\n");
 
-    PrintImports(file, &out);
+    PrintImports(file, &out, params);
 
-    PrintTransformers(file, &out, params);
+    PrintTransformers(file, &out);
 
-    PrintServices(file, &out);
+    PrintServices(file, &out, params);
 
-    out.Print(GetNodeComments(file, false).c_str());
+    out.PrintRaw(GetNodeComments(file, false).c_str());
   }
   return output;
 }

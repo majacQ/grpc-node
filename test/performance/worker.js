@@ -18,30 +18,36 @@
 
 'use strict';
 
+var assert = require('assert');
 var console = require('console');
 var WorkerServiceImpl = require('./worker_service_impl');
 
 var grpc = require('../any_grpc').server;
-var protoLoader = require('../../packages/grpc-protobufjs');
+var protoLoader = require('../../packages/proto-loader');
 var protoPackage = protoLoader.loadSync(
     'src/proto/grpc/testing/worker_service.proto',
     {keepCase: true,
      defaults: true,
      enums: String,
      oneofs: true,
-     includeDirs: [__dirname + '/../../packages/grpc-native-core/deps/grpc']});
+     includeDirs: [__dirname + '/../proto/']});
 var serviceProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
-function runServer(port, benchmark_impl) {
+function runServer(port, benchmark_impl, callback) {
   var server_creds = grpc.ServerCredentials.createInsecure();
   var server = new grpc.Server();
   server.addService(serviceProto.WorkerService.service,
                     new WorkerServiceImpl(benchmark_impl, server));
   var address = '0.0.0.0:' + port;
-  server.bind(address, server_creds);
-  server.start();
-  console.log('running QPS worker on %s', address);
-  return server;
+  server.bindAsync(address, server_creds, (err) => {
+    if (err) {
+      return callback(err);
+    }
+
+    server.start();
+    console.log('running QPS worker on %s', address);
+    callback(null, server);
+  });
 }
 
 if (require.main === module) {
@@ -50,7 +56,9 @@ if (require.main === module) {
   var argv = parseArgs(process.argv, {
     string: ['driver_port', 'benchmark_impl']
   });
-  runServer(argv.driver_port, argv.benchmark_impl);
+  runServer(argv.driver_port, argv.benchmark_impl, (err, server) => {
+    assert.ifError(err);
+  });
 }
 
 exports.runServer = runServer;

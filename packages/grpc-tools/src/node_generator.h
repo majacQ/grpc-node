@@ -23,10 +23,11 @@
 
 namespace grpc_node_generator {
 
-// Contains all the parameters that are parsed from the command line.
 struct Parameters {
-  // Sets the earliest version of nodejs that needs to be supported.
-  int minimum_node_version;
+  // Generate a package definition object instead of Client classes
+  bool generate_package_definition;
+  // Use pure JavaScript gRPC Client
+  bool grpc_js;
 };
 
 grpc::string GenerateFile(const grpc::protobuf::FileDescriptor* file,

@@ -37,23 +37,23 @@ var genericService = require('./generic_service');
 
 // TODO(murgatroid99): use multiple grpc implementations
 var grpc = require('../any_grpc').client;
-var protoLoader = require('../../packages/grpc-protobufjs');
+var protoLoader = require('../../packages/proto-loader');
 var protoPackage = protoLoader.loadSync(
     'src/proto/grpc/testing/benchmark_service.proto',
     {keepCase: true,
      defaults: true,
      enums: String,
      oneofs: true,
-     includeDirs: [__dirname + '/../../packages/grpc-native-core/deps/grpc']});
+     includeDirs: [__dirname + '/../proto/']});
 var serviceProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }

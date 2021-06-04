@@ -21,7 +21,7 @@
 var fs = require('fs');
 var path = require('path');
 var grpc = require('../any_grpc').client;
-var protoLoader = require('../../packages/grpc-protobufjs');
+var protoLoader = require('../../packages/proto-loader');
 var GoogleAuth = require('google-auth-library');
 
 var protoPackage = protoLoader.loadSync(
@@ -29,7 +29,7 @@ var protoPackage = protoLoader.loadSync(
     {keepCase: true,
      defaults: true,
      enums: String,
-     includeDirs: [__dirname + '/../../packages/grpc-native-core/deps/grpc']});
+     includeDirs: [__dirname + '/../proto/']});
 var testProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 var assert = require('assert');
@@ -49,10 +49,10 @@ var ECHO_TRAILING_KEY = 'x-grpc-test-echo-trailing-bin';
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }
@@ -294,7 +294,7 @@ function customMetadata(client, done) {
   done = multiDone(done, 5);
   var metadata = new grpc.Metadata();
   metadata.set(ECHO_INITIAL_KEY, 'test_initial_metadata_value');
-  metadata.set(ECHO_TRAILING_KEY, new Buffer('ababab', 'hex'));
+  metadata.set(ECHO_TRAILING_KEY, Buffer.from('ababab', 'hex'));
   var arg = {
     response_type: 'COMPRESSABLE',
     response_size: 314159,
