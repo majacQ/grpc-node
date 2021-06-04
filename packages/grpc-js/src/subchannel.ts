@@ -22,17 +22,26 @@ import { Http2CallStream } from './call-stream';
 import { ChannelOptions } from './channel-options';
 import { PeerCertificate, checkServerIdentity } from 'tls';
 import { ConnectivityState } from './channel';
-import { BackoffTimeout } from './backoff-timeout';
+import { BackoffTimeout, BackoffOptions } from './backoff-timeout';
 import { getDefaultAuthority } from './resolver';
 import * as logging from './logging';
 import { LogVerbosity } from './constants';
+import { getProxiedConnection, ProxyConnectionResult } from './http_proxy';
+import * as net from 'net';
+import { GrpcUri, parseUri, splitHostPort, uriToString } from './uri-parser';
+import { ConnectionOptions } from 'tls';
+import { FilterFactory, Filter } from './filter';
 
-const { version: clientVersion } = require('../../package.json');
+const clientVersion = require('../../package.json').version;
 
 const TRACER_NAME = 'subchannel';
 
 function trace(text: string): void {
   logging.trace(LogVerbosity.DEBUG, TRACER_NAME, text);
+}
+
+function refTrace(text: string): void {
+  logging.trace(LogVerbosity.DEBUG, 'subchannel_refcount', text);
 }
 
 const MIN_CONNECT_TIMEOUT_MS = 20000;
@@ -72,6 +81,52 @@ function uniformRandom(min: number, max: number) {
 }
 
 const tooManyPingsData: Buffer = Buffer.from('too_many_pings', 'ascii');
+
+export interface TcpSubchannelAddress {
+  port: number;
+  host: string;
+}
+
+export interface IpcSubchannelAddress {
+  path: string;
+}
+
+/**
+ * This represents a single backend address to connect to. This interface is a
+ * subset of net.SocketConnectOpts, i.e. the options described at
+ * https://nodejs.org/api/net.html#net_socket_connect_options_connectlistener.
+ * Those are in turn a subset of the options that can be passed to http2.connect.
+ */
+export type SubchannelAddress = TcpSubchannelAddress | IpcSubchannelAddress;
+
+export function isTcpSubchannelAddress(
+  address: SubchannelAddress
+): address is TcpSubchannelAddress {
+  return 'port' in address;
+}
+
+export function subchannelAddressEqual(
+  address1: SubchannelAddress,
+  address2: SubchannelAddress
+): boolean {
+  if (isTcpSubchannelAddress(address1)) {
+    return (
+      isTcpSubchannelAddress(address2) &&
+      address1.host === address2.host &&
+      address1.port === address2.port
+    );
+  } else {
+    return !isTcpSubchannelAddress(address2) && address1.path === address2.path;
+  }
+}
+
+export function subchannelAddressToString(address: SubchannelAddress): string {
+  if (isTcpSubchannelAddress(address)) {
+    return address.host + ':' + address.port;
+  } else {
+    return address.path;
+  }
+}
 
 export class Subchannel {
   /**
@@ -125,6 +180,10 @@ export class Subchannel {
    * Timer reference tracking when the most recent ping will be considered lost
    */
   private keepaliveTimeoutId: NodeJS.Timer;
+  /**
+   * Indicates whether keepalive pings should be sent without any active calls
+   */
+  private keepaliveWithoutCalls: boolean = false;
 
   /**
    * Tracks calls with references to this subchannel
@@ -134,6 +193,11 @@ export class Subchannel {
    * Tracks channels and subchannel pools with references to this subchannel
    */
   private refcount = 0;
+
+  /**
+   * A string representation of the subchannel address, for logging/tracing
+   */
+  private subchannelAddressString: string;
 
   /**
    * A class representing a connection to a single backend.
@@ -146,8 +210,8 @@ export class Subchannel {
    *     connection
    */
   constructor(
-    private channelTarget: string,
-    private subchannelAddress: string,
+    private channelTarget: GrpcUri,
+    private subchannelAddress: SubchannelAddress,
     private options: ChannelOptions,
     private credentials: ChannelCredentials
   ) {
@@ -157,7 +221,7 @@ export class Subchannel {
       `grpc-node-js/${clientVersion}`,
       options['grpc.secondary_user_agent'],
     ]
-      .filter(e => e)
+      .filter((e) => e)
       .join(' '); // remove falsey values first
 
     if ('grpc.keepalive_time_ms' in options) {
@@ -166,23 +230,37 @@ export class Subchannel {
     if ('grpc.keepalive_timeout_ms' in options) {
       this.keepaliveTimeoutMs = options['grpc.keepalive_timeout_ms']!;
     }
+    if ('grpc.keepalive_permit_without_calls' in options) {
+      this.keepaliveWithoutCalls = options['grpc.keepalive_permit_without_calls'] === 1;
+    } else {
+      this.keepaliveWithoutCalls = false;
+    }
     this.keepaliveIntervalId = setTimeout(() => {}, 0);
     clearTimeout(this.keepaliveIntervalId);
     this.keepaliveTimeoutId = setTimeout(() => {}, 0);
     clearTimeout(this.keepaliveTimeoutId);
+    const backoffOptions: BackoffOptions = {
+      initialDelay: options['grpc.initial_reconnect_backoff_ms'],
+      maxDelay: options['grpc.max_reconnect_backoff_ms'],
+    };
     this.backoffTimeout = new BackoffTimeout(() => {
-      if (this.continueConnecting) {
-        this.transitionToState(
-          [ConnectivityState.TRANSIENT_FAILURE, ConnectivityState.CONNECTING],
-          ConnectivityState.CONNECTING
-        );
-      } else {
-        this.transitionToState(
-          [ConnectivityState.TRANSIENT_FAILURE, ConnectivityState.CONNECTING],
-          ConnectivityState.IDLE
-        );
-      }
-    });
+      this.handleBackoffTimer();
+    }, backoffOptions);
+    this.subchannelAddressString = subchannelAddressToString(subchannelAddress);
+  }
+
+  private handleBackoffTimer() {
+    if (this.continueConnecting) {
+      this.transitionToState(
+        [ConnectivityState.TRANSIENT_FAILURE],
+        ConnectivityState.CONNECTING
+      );
+    } else {
+      this.transitionToState(
+        [ConnectivityState.TRANSIENT_FAILURE],
+        ConnectivityState.IDLE
+      );
+    }
   }
 
   /**
@@ -198,6 +276,7 @@ export class Subchannel {
   }
 
   private sendPing() {
+    logging.trace(LogVerbosity.DEBUG, 'keepalive', 'Sending ping to ' + this.subchannelAddressString);
     this.keepaliveTimeoutId = setTimeout(() => {
       this.transitionToState([ConnectivityState.READY], ConnectivityState.IDLE);
     }, this.keepaliveTimeoutMs);
@@ -212,7 +291,8 @@ export class Subchannel {
     this.keepaliveIntervalId = setInterval(() => {
       this.sendPing();
     }, this.keepaliveTimeMs);
-    this.sendPing();
+    /* Don't send a ping immediately because whatever caused us to start
+     * sending pings should also involve some network activity. */
   }
 
   private stopKeepalivePings() {
@@ -220,9 +300,16 @@ export class Subchannel {
     clearTimeout(this.keepaliveTimeoutId);
   }
 
-  private startConnectingInternal() {
-    const connectionOptions: http2.SecureClientSessionOptions =
+  private createSession(proxyConnectionResult: ProxyConnectionResult) {
+    const targetAuthority = getDefaultAuthority(
+      proxyConnectionResult.realTarget ?? this.channelTarget
+    );
+    let connectionOptions: http2.SecureClientSessionOptions =
       this.credentials._getConnectionOptions() || {};
+    connectionOptions.maxSendHeaderBlockLength = Number.MAX_SAFE_INTEGER;
+    if ('grpc-node.max_session_memory' in this.options) {
+      connectionOptions.maxSessionMemory = this.options['grpc-node.max_session_memory'];
+    }
     let addressScheme = 'http://';
     if ('secureContext' in connectionOptions) {
       addressScheme = 'https://';
@@ -241,11 +328,61 @@ export class Subchannel {
         };
         connectionOptions.servername = sslTargetNameOverride;
       } else {
-        connectionOptions.servername = getDefaultAuthority(this.channelTarget);
+        const authorityHostname =
+          splitHostPort(targetAuthority)?.host ?? 'localhost';
+        // We want to always set servername to support SNI
+        connectionOptions.servername = authorityHostname;
       }
+      if (proxyConnectionResult.socket) {
+        /* This is part of the workaround for
+         * https://github.com/nodejs/node/issues/32922. Without that bug,
+         * proxyConnectionResult.socket would always be a plaintext socket and
+         * this would say
+         * connectionOptions.socket = proxyConnectionResult.socket; */
+        connectionOptions.createConnection = (authority, option) => {
+          return proxyConnectionResult.socket!;
+        };
+      }
+    } else {
+      /* In all but the most recent versions of Node, http2.connect does not use
+       * the options when establishing plaintext connections, so we need to
+       * establish that connection explicitly. */
+      connectionOptions.createConnection = (authority, option) => {
+        if (proxyConnectionResult.socket) {
+          return proxyConnectionResult.socket;
+        } else {
+          /* net.NetConnectOpts is declared in a way that is more restrictive
+           * than what net.connect will actually accept, so we use the type
+           * assertion to work around that. */
+          return net.connect(this.subchannelAddress);
+        }
+      };
     }
+
+    connectionOptions = {
+      ...connectionOptions,
+      ...this.subchannelAddress,
+    };
+
+    /* http2.connect uses the options here:
+     * https://github.com/nodejs/node/blob/70c32a6d190e2b5d7b9ff9d5b6a459d14e8b7d59/lib/internal/http2/core.js#L3028-L3036
+     * The spread operator overides earlier values with later ones, so any port
+     * or host values in the options will be used rather than any values extracted
+     * from the first argument. In addition, the path overrides the host and port,
+     * as documented for plaintext connections here:
+     * https://nodejs.org/api/net.html#net_socket_connect_options_connectlistener
+     * and for TLS connections here:
+     * https://nodejs.org/api/tls.html#tls_tls_connect_options_callback. In
+     * earlier versions of Node, http2.connect passes these options to
+     * tls.connect but not net.connect, so in the insecure case we still need
+     * to set the createConnection option above to create the connection
+     * explicitly. We cannot do that in the TLS case because http2.connect
+     * passes necessary additional options to tls.connect.
+     * The first argument just needs to be parseable as a URL and the scheme
+     * determines whether the connection will be established over TLS or not.
+     */
     const session = http2.connect(
-      addressScheme + this.subchannelAddress,
+      addressScheme + targetAuthority,
       connectionOptions
     );
     this.session = session;
@@ -287,15 +424,20 @@ export class Subchannel {
             errorCode === http2.constants.NGHTTP2_ENHANCE_YOUR_CALM &&
             opaqueData.equals(tooManyPingsData)
           ) {
-            logging.log(
-              LogVerbosity.ERROR,
-              `Connection to ${this.channelTarget} rejected by server because of excess pings`
-            );
             this.keepaliveTimeMs = Math.min(
               2 * this.keepaliveTimeMs,
               KEEPALIVE_MAX_TIME_MS
             );
+            logging.log(
+              LogVerbosity.ERROR,
+              `Connection to ${uriToString(this.channelTarget)} at ${this.subchannelAddressString} rejected by server because of excess pings. Increasing ping interval to ${this.keepaliveTimeMs} ms`
+            );
           }
+          trace(
+            this.subchannelAddressString +
+              ' connection closed by GOAWAY with code ' +
+              errorCode
+          );
           this.transitionToState(
             [ConnectivityState.CONNECTING, ConnectivityState.READY],
             ConnectivityState.IDLE
@@ -303,10 +445,73 @@ export class Subchannel {
         }
       }
     );
-    session.once('error', error => {
+    session.once('error', (error) => {
       /* Do nothing here. Any error should also trigger a close event, which is
        * where we want to handle that.  */
+      trace(
+        this.subchannelAddressString +
+          ' connection closed with error ' +
+          (error as Error).message
+      );
     });
+  }
+
+  private startConnectingInternal() {
+    /* Pass connection options through to the proxy so that it's able to
+     * upgrade it's connection to support tls if needed.
+     * This is a workaround for https://github.com/nodejs/node/issues/32922
+     * See https://github.com/grpc/grpc-node/pull/1369 for more info. */
+    const connectionOptions: ConnectionOptions =
+      this.credentials._getConnectionOptions() || {};
+
+    if ('secureContext' in connectionOptions) {
+      connectionOptions.ALPNProtocols = ['h2'];
+      // If provided, the value of grpc.ssl_target_name_override should be used
+      // to override the target hostname when checking server identity.
+      // This option is used for testing only.
+      if (this.options['grpc.ssl_target_name_override']) {
+        const sslTargetNameOverride = this.options[
+          'grpc.ssl_target_name_override'
+        ]!;
+        connectionOptions.checkServerIdentity = (
+          host: string,
+          cert: PeerCertificate
+        ): Error | undefined => {
+          return checkServerIdentity(sslTargetNameOverride, cert);
+        };
+        connectionOptions.servername = sslTargetNameOverride;
+      } else {
+        if ('grpc.http_connect_target' in this.options) {
+          /* This is more or less how servername will be set in createSession
+           * if a connection is successfully established through the proxy.
+           * If the proxy is not used, these connectionOptions are discarded
+           * anyway */
+          const targetPath = getDefaultAuthority(
+            parseUri(this.options['grpc.http_connect_target'] as string) ?? {
+              path: 'localhost',
+            }
+          );
+          const hostPort = splitHostPort(targetPath);
+          connectionOptions.servername = hostPort?.host ?? targetPath;
+        }
+      }
+    }
+
+    getProxiedConnection(
+      this.subchannelAddress,
+      this.options,
+      connectionOptions
+    ).then(
+      (result) => {
+        this.createSession(result);
+      },
+      (reason) => {
+        this.transitionToState(
+          [ConnectivityState.CONNECTING],
+          ConnectivityState.TRANSIENT_FAILURE
+        );
+      }
+    );
   }
 
   /**
@@ -324,7 +529,7 @@ export class Subchannel {
       return false;
     }
     trace(
-      this.subchannelAddress +
+      this.subchannelAddressString +
         ' ' +
         ConnectivityState[this.connectivityState] +
         ' -> ' +
@@ -340,6 +545,9 @@ export class Subchannel {
             listener();
           }
         });
+        if (this.keepaliveWithoutCalls) {
+          this.startKeepalivePings();
+        }
         break;
       case ConnectivityState.CONNECTING:
         this.startBackoff();
@@ -352,12 +560,16 @@ export class Subchannel {
         }
         this.session = null;
         this.stopKeepalivePings();
+        /* If the backoff timer has already ended by the time we get to the
+         * TRANSIENT_FAILURE state, we want to immediately transition out of
+         * TRANSIENT_FAILURE as though the backoff timer is ending right now */
+        if (!this.backoffTimeout.isRunning()) {
+          process.nextTick(() => {
+            this.handleBackoffTimer();
+          });
+        }
         break;
       case ConnectivityState.IDLE:
-        /* Stopping the backoff timer here is probably redundant because we
-         * should only transition to the IDLE state as a result of the timer
-         * ending, but we still want to reset the backoff timeout. */
-        this.stopBackoff();
         if (this.session) {
           this.session.close();
         }
@@ -386,7 +598,6 @@ export class Subchannel {
       this.transitionToState(
         [
           ConnectivityState.CONNECTING,
-          ConnectivityState.IDLE,
           ConnectivityState.READY,
         ],
         ConnectivityState.TRANSIENT_FAILURE
@@ -395,8 +606,8 @@ export class Subchannel {
   }
 
   callRef() {
-    trace(
-      this.subchannelAddress +
+    refTrace(
+      this.subchannelAddressString +
         ' callRefcount ' +
         this.callRefcount +
         ' -> ' +
@@ -406,14 +617,17 @@ export class Subchannel {
       if (this.session) {
         this.session.ref();
       }
-      this.startKeepalivePings();
+      this.backoffTimeout.ref();
+      if (!this.keepaliveWithoutCalls) {
+        this.startKeepalivePings();
+      }
     }
     this.callRefcount += 1;
   }
 
   callUnref() {
-    trace(
-      this.subchannelAddress +
+    refTrace(
+      this.subchannelAddressString +
         ' callRefcount ' +
         this.callRefcount +
         ' -> ' +
@@ -424,15 +638,18 @@ export class Subchannel {
       if (this.session) {
         this.session.unref();
       }
-      this.stopKeepalivePings();
+      this.backoffTimeout.unref();
+      if (!this.keepaliveWithoutCalls) {
+        this.stopKeepalivePings();
+      }
       this.checkBothRefcounts();
     }
   }
 
   ref() {
-    trace(
-      this.subchannelAddress +
-        ' callRefcount ' +
+    refTrace(
+      this.subchannelAddressString +
+        ' refcount ' +
         this.refcount +
         ' -> ' +
         (this.refcount + 1)
@@ -441,9 +658,9 @@ export class Subchannel {
   }
 
   unref() {
-    trace(
-      this.subchannelAddress +
-        ' callRefcount ' +
+    refTrace(
+      this.subchannelAddressString +
+        ' refcount ' +
         this.refcount +
         ' -> ' +
         (this.refcount - 1)
@@ -467,7 +684,11 @@ export class Subchannel {
    * @param metadata
    * @param callStream
    */
-  startCallStream(metadata: Metadata, callStream: Http2CallStream) {
+  startCallStream(
+    metadata: Metadata,
+    callStream: Http2CallStream,
+    extraFilterFactory?: FilterFactory<Filter>
+  ) {
     const headers = metadata.toHttp2Headers();
     headers[HTTP2_HEADER_AUTHORITY] = callStream.getHost();
     headers[HTTP2_HEADER_USER_AGENT] = this.userAgent;
@@ -475,8 +696,30 @@ export class Subchannel {
     headers[HTTP2_HEADER_METHOD] = 'POST';
     headers[HTTP2_HEADER_PATH] = callStream.getMethod();
     headers[HTTP2_HEADER_TE] = 'trailers';
-    const http2Stream = this.session!.request(headers);
-    callStream.attachHttp2Stream(http2Stream, this);
+    let http2Stream: http2.ClientHttp2Stream;
+    /* In theory, if an error is thrown by session.request because session has
+     * become unusable (e.g. because it has received a goaway), this subchannel
+     * should soon see the corresponding close or goaway event anyway and leave
+     * READY. But we have seen reports that this does not happen
+     * (https://github.com/googleapis/nodejs-firestore/issues/1023#issuecomment-653204096)
+     * so for defense in depth, we just discard the session when we see an
+     * error here.
+     */
+    try {
+      http2Stream = this.session!.request(headers);
+    } catch (e) {
+      this.transitionToState(
+        [ConnectivityState.READY],
+        ConnectivityState.TRANSIENT_FAILURE
+      );
+      throw e;
+    }
+    let headersString = '';
+    for (const header of Object.keys(headers)) {
+      headersString += '\t\t' + header + ': ' + headers[header] + '\n';
+    }
+    logging.trace(LogVerbosity.DEBUG, 'call_stream', 'Starting stream on subchannel ' + this.subchannelAddressString + ' with headers\n' + headersString);
+    callStream.attachHttp2Stream(http2Stream, this, extraFilterFactory);
   }
 
   /**
@@ -553,6 +796,6 @@ export class Subchannel {
   }
 
   getAddress(): string {
-    return this.subchannelAddress;
+    return this.subchannelAddressString;
   }
 }

@@ -25,8 +25,19 @@ export interface ChannelOptions {
   'grpc.default_authority'?: string;
   'grpc.keepalive_time_ms'?: number;
   'grpc.keepalive_timeout_ms'?: number;
+  'grpc.keepalive_permit_without_calls'?: number;
   'grpc.service_config'?: string;
-  [key: string]: string | number | undefined;
+  'grpc.max_concurrent_streams'?: number;
+  'grpc.initial_reconnect_backoff_ms'?: number;
+  'grpc.max_reconnect_backoff_ms'?: number;
+  'grpc.use_local_subchannel_pool'?: number;
+  'grpc.max_send_message_length'?: number;
+  'grpc.max_receive_message_length'?: number;
+  'grpc.enable_http_proxy'?: number;
+  'grpc.http_connect_target'?: string;
+  'grpc.http_connect_creds'?: string;
+  'grpc-node.max_session_memory'?: number;
+  [key: string]: any;
 }
 
 /**
@@ -40,7 +51,16 @@ export const recognizedOptions = {
   'grpc.default_authority': true,
   'grpc.keepalive_time_ms': true,
   'grpc.keepalive_timeout_ms': true,
+  'grpc.keepalive_permit_without_calls': true,
   'grpc.service_config': true,
+  'grpc.max_concurrent_streams': true,
+  'grpc.initial_reconnect_backoff_ms': true,
+  'grpc.max_reconnect_backoff_ms': true,
+  'grpc.use_local_subchannel_pool': true,
+  'grpc.max_send_message_length': true,
+  'grpc.max_receive_message_length': true,
+  'grpc.enable_http_proxy': true,
+  'grpc-node.max_session_memory': true,
 };
 
 export function channelOptionsEqual(
