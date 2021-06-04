@@ -37,25 +37,20 @@ class NodeGrpcGenerator : public grpc::protobuf::compiler::CodeGenerator {
                 grpc::protobuf::compiler::GeneratorContext* context,
                 grpc::string* error) const {
     grpc_node_generator::Parameters generator_parameters;
-    generator_parameters.minimum_node_version = 4;
-
+    generator_parameters.generate_package_definition = false;
+    generator_parameters.grpc_js = false;
     if (!parameter.empty()) {
       std::vector<grpc::string> parameters_list =
           grpc_generator::tokenize(parameter, ",");
       for (auto parameter_string = parameters_list.begin();
            parameter_string != parameters_list.end(); parameter_string++) {
-        std::vector<grpc::string> param =
-            grpc_generator::tokenize(*parameter_string, "=");
-        if (param[0] == "minimum_node_version") {
-          sscanf(param[1].c_str(), "%d",
-                 &generator_parameters.minimum_node_version);
-        } else {
-          *error = grpc::string("Unknown parameter: ") + *parameter_string;
-          return false;
+        if (*parameter_string == "generate_package_definition") {
+          generator_parameters.generate_package_definition = true;
+        } else if (*parameter_string == "grpc_js") {
+          generator_parameters.grpc_js = true;
         }
       }
     }
-
     grpc::string code = GenerateFile(file, generator_parameters);
     if (code.size() == 0) {
       return true;

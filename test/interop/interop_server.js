@@ -18,19 +18,20 @@
 
 'use strict';
 
+var assert = require('assert');
 var fs = require('fs');
 var path = require('path');
 var _ = require('lodash');
 var AsyncDelayQueue = require('./async_delay_queue');
 var grpc = require('../any_grpc').server;
 // TODO(murgatroid99): do this import more cleanly
-var protoLoader = require('../../packages/grpc-protobufjs');
+var protoLoader = require('../../packages/proto-loader');
 var protoPackage = protoLoader.loadSync(
     'src/proto/grpc/testing/test.proto',
     {keepCase: true,
      defaults: true,
      enums: String,
-     includeDirs: [__dirname + '/../../packages/grpc-native-core/deps/grpc']});
+     includeDirs: [__dirname + '/../proto/']});
 var testProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 var ECHO_INITIAL_KEY = 'x-grpc-test-echo-initial';
@@ -39,10 +40,10 @@ var ECHO_TRAILING_KEY = 'x-grpc-test-echo-trailing-bin';
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }
@@ -199,12 +200,16 @@ function handleHalfDuplex(call) {
  * Get a server object bound to the given port
  * @param {string} port Port to which to bind
  * @param {boolean} tls Indicates that the bound port should use TLS
- * @return {{server: Server, port: number}} Server object bound to the support,
- *     and port number that the server is bound to
+ * @param {function(Error, {{server: Server, port: number}})} callback Callback
+ *     to call with result or error
+ * @param {object?} options Optional additional options to use when
+ *     constructing the server
  */
-function getServer(port, tls) {
+function getServer(port, tls, callback, options) {
   // TODO(mlumish): enable TLS functionality
-  var options = {};
+  if (!options) {
+    options = {};
+  }
   var server_creds;
   if (tls) {
     var key_path = path.join(__dirname, '../data/server1.key');
@@ -227,8 +232,13 @@ function getServer(port, tls) {
     fullDuplexCall: handleFullDuplex,
     halfDuplexCall: handleHalfDuplex
   });
-  var port_num = server.bind('0.0.0.0:' + port, server_creds);
-  return {server: server, port: port_num};
+  server.bindAsync('0.0.0.0:' + port, server_creds, (err, port_num) => {
+    if (err) {
+      return callback(err);
+    }
+
+    callback(null, {server: server, port: port_num});
+  });
 }
 
 if (require.main === module) {
@@ -236,9 +246,11 @@ if (require.main === module) {
   var argv = parseArgs(process.argv, {
     string: ['port', 'use_tls']
   });
-  var server_obj = getServer(argv.port, argv.use_tls === 'true');
-  console.log('Server attaching to port ' + argv.port);
-  server_obj.server.start();
+  getServer(argv.port, argv.use_tls === 'true', (err, server_obj) => {
+    assert.ifError(err);
+    console.log('Server attaching to port ' + argv.port);
+    server_obj.server.start();
+  });
 }
 
 /**

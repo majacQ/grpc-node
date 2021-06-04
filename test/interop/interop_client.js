@@ -21,15 +21,16 @@
 var fs = require('fs');
 var path = require('path');
 var grpc = require('../any_grpc').client;
-var protoLoader = require('../../packages/grpc-protobufjs');
-var GoogleAuth = require('google-auth-library');
+var protoLoader = require('../../packages/proto-loader');
+
+const { GoogleAuth } = require('google-auth-library');
 
 var protoPackage = protoLoader.loadSync(
     'src/proto/grpc/testing/test.proto',
     {keepCase: true,
      defaults: true,
      enums: String,
-     includeDirs: [__dirname + '/../../packages/grpc-native-core/deps/grpc']});
+     includeDirs: [__dirname + '/../proto/']});
 var testProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 var assert = require('assert');
@@ -49,10 +50,10 @@ var ECHO_TRAILING_KEY = 'x-grpc-test-echo-trailing-bin';
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }
@@ -294,7 +295,7 @@ function customMetadata(client, done) {
   done = multiDone(done, 5);
   var metadata = new grpc.Metadata();
   metadata.set(ECHO_INITIAL_KEY, 'test_initial_metadata_value');
-  metadata.set(ECHO_TRAILING_KEY, new Buffer('ababab', 'hex'));
+  metadata.set(ECHO_TRAILING_KEY, Buffer.from('ababab', 'hex'));
   var arg = {
     response_type: 'COMPRESSABLE',
     response_size: 314159,
@@ -463,60 +464,35 @@ function oauth2Test(client, done, extra) {
 }
 
 function perRpcAuthTest(client, done, extra) {
-  (new GoogleAuth()).getApplicationDefault(function(err, credential) {
+  var arg = {
+    fill_username: true,
+    fill_oauth_scope: true
+  };
+  const creds = grpc.credentials.createFromGoogleCredential(new GoogleAuth({scopes: extra.oauth_scope}));
+  client.unaryCall(arg, {credentials: creds}, function(err, resp) {
     assert.ifError(err);
-    var arg = {
-      fill_username: true,
-      fill_oauth_scope: true
-    };
-    var scope = extra.oauth_scope;
-    if (credential.createScopedRequired() && scope) {
-      credential = credential.createScoped(scope);
+    assert.strictEqual(resp.username, SERVICE_ACCOUNT_EMAIL);
+    assert(extra.oauth_scope.indexOf(resp.oauth_scope) > -1);
+    if (done) {
+      done();
     }
-    var creds = grpc.credentials.createFromGoogleCredential(credential);
-    client.unaryCall(arg, {credentials: creds}, function(err, resp) {
-      assert.ifError(err);
-      assert.strictEqual(resp.username, SERVICE_ACCOUNT_EMAIL);
-      assert(extra.oauth_scope.indexOf(resp.oauth_scope) > -1);
-      if (done) {
-        done();
-      }
-    });
   });
 }
 
 function getApplicationCreds(scope, callback) {
-  (new GoogleAuth()).getApplicationDefault(function(err, credential) {
-    if (err) {
-      callback(err);
-      return;
-    }
-    if (credential.createScopedRequired() && scope) {
-      credential = credential.createScoped(scope);
-    }
-    callback(null, grpc.credentials.createFromGoogleCredential(credential));
-  });
+  callback(null, grpc.credentials.createFromGoogleCredential(new GoogleAuth({scopes: scope})));
 }
 
 function getOauth2Creds(scope, callback) {
-  (new GoogleAuth()).getApplicationDefault(function(err, credential) {
-    if (err) {
-      callback(err);
-      return;
-    }
-    credential = credential.createScoped(scope);
-    credential.getAccessToken(function(err, token) {
-      if (err) {
-        callback(err);
-        return;
-      }
-      var updateMd = function(service_url, callback) {
-        var metadata = new grpc.Metadata();
-        metadata.add('authorization', 'Bearer ' + token);
-        callback(null, metadata);
-      };
-      callback(null, grpc.credentials.createFromMetadataGenerator(updateMd));
-    });
+  (new GoogleAuth()).getAccessToken().then((token) => {
+    var updateMd = function(service_url, callback) {
+      var metadata = new grpc.Metadata();
+      metadata.add('authorization', 'Bearer ' + token);
+      callback(null, metadata);
+    };
+    callback(null, grpc.credentials.createFromMetadataGenerator(updateMd));
+  }, (error) => {
+    callback(error);
   });
 }
 

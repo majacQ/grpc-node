@@ -11,7 +11,6 @@
   "devDependencies": {
     "@types/execa": "^0.8.0",
     "@types/gulp": "^4.0.5",
-    "@types/gulp-help": "0.0.34",
     "@types/gulp-mocha": "0.0.31",
     "@types/ncp": "^2.0.1",
     "@types/node": "^8.0.32",
@@ -20,8 +19,7 @@
     "coveralls": "^3.0.1",
     "del": "^3.0.0",
     "execa": "^0.8.0",
-    "gulp": "^3.9.1",
-    "gulp-help": "^1.6.1",
+    "gulp": "^4.0.1",
     "gulp-jsdoc3": "^1.0.1",
     "gulp-jshint": "^2.0.4",
     "gulp-mocha": "^4.3.1",
@@ -42,9 +40,9 @@
     "semver": "^5.5.0",
     "symlink": "^2.1.0",
     "through2": "^2.0.3",
-    "ts-node": "^3.3.0",
+    "ts-node": "^8.1.0",
     "tslint": "^5.5.0",
-    "typescript": "~2.7.0",
+    "typescript": "^3.7.2",
     "xml2js": "^0.4.19"
   },
   "contributors": [
@@ -55,10 +53,8 @@
   "nyc": {
     "include": [
       "packages/grpc-health-check/health.js",
-      "packages/grpc-js-core/build/src/*",
-      "packages/grpc-native-core/index.js",
-      "packages/grpc-native-core/src/*.js",
-      "packages/grpc-protobufjs/build/src/*"
+      "packages/grpc-js/build/src/*",
+      "packages/proto-loader/build/src/*"
     ],
     "cache": true,
     "all": true
