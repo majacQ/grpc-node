@@ -38,7 +38,7 @@ call npm install || goto :error
 SET JUNIT_REPORT_STACK=1
 SET FAILED=0
 
-for %%v in (6 7 8 9 10 11 12) do (
+for %%v in (8 10 12) do (
   call nvm install %%v
   call nvm use %%v
   if "%%v"=="4" (
@@ -56,6 +56,7 @@ for %%v in (6 7 8 9 10 11 12) do (
   call .\node_modules\.bin\gulp cleanAll || SET FAILED=1
   call .\node_modules\.bin\gulp setupWindows || SET FAILED=1
   call .\node_modules\.bin\gulp test || SET FAILED=1
+  cmd.exe /c "SET GRPC_DNS_RESOLVER=ares& call .\node_modules\.bin\gulp nativeTestOnly" || SET FAILED=1
 )
 
 node merge_kokoro_logs.js

@@ -15,8 +15,8 @@
  *
  */
 
-import {Call, StatusObject, WriteObject} from './call-stream';
-import {Metadata} from './metadata';
+import { Call, StatusObject, WriteObject } from './call-stream';
+import { Metadata } from './metadata';
 
 /**
  * Filter classes represent related per-call logic and state that is primarily
@@ -25,21 +25,21 @@ import {Metadata} from './metadata';
 export interface Filter {
   sendMetadata(metadata: Promise<Metadata>): Promise<Metadata>;
 
-  receiveMetadata(metadata: Promise<Metadata>): Promise<Metadata>;
+  receiveMetadata(metadata: Metadata): Metadata;
 
   sendMessage(message: Promise<WriteObject>): Promise<WriteObject>;
 
   receiveMessage(message: Promise<Buffer>): Promise<Buffer>;
 
-  receiveTrailers(status: Promise<StatusObject>): Promise<StatusObject>;
+  receiveTrailers(status: StatusObject): StatusObject;
 }
 
-export abstract class BaseFilter {
+export abstract class BaseFilter implements Filter {
   async sendMetadata(metadata: Promise<Metadata>): Promise<Metadata> {
     return metadata;
   }
 
-  async receiveMetadata(metadata: Promise<Metadata>): Promise<Metadata> {
+  receiveMetadata(metadata: Metadata): Metadata {
     return metadata;
   }
 
@@ -51,7 +51,7 @@ export abstract class BaseFilter {
     return message;
   }
 
-  async receiveTrailers(status: Promise<StatusObject>): Promise<StatusObject> {
+  receiveTrailers(status: StatusObject): StatusObject {
     return status;
   }
 }

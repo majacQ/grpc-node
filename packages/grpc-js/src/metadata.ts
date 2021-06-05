@@ -16,10 +16,12 @@
  */
 
 import * as http2 from 'http2';
+import { log } from './logging';
+import { LogVerbosity } from './constants';
 const LEGAL_KEY_REGEX = /^[0-9a-z_.-]+$/;
 const LEGAL_NON_BINARY_VALUE_REGEX = /^[ -~]*$/;
 
-export type MetadataValue = string|Buffer;
+export type MetadataValue = string | Buffer;
 export type MetadataObject = Map<string, MetadataValue[]>;
 
 function isLegalKey(key: string): boolean {
@@ -34,6 +36,10 @@ function isBinaryKey(key: string): boolean {
   return key.endsWith('-bin');
 }
 
+function isCustomMetadata(key: string): boolean {
+  return !key.startsWith('grpc-');
+}
+
 function normalizeKey(key: string): string {
   return key.toLowerCase();
 }
@@ -42,23 +48,37 @@ function validate(key: string, value?: MetadataValue): void {
   if (!isLegalKey(key)) {
     throw new Error('Metadata key "' + key + '" contains illegal characters');
   }
-  if (value != null) {
+  if (value !== null && value !== undefined) {
     if (isBinaryKey(key)) {
       if (!(value instanceof Buffer)) {
-        throw new Error('keys that end with \'-bin\' must have Buffer values');
+        throw new Error("keys that end with '-bin' must have Buffer values");
       }
     } else {
       if (value instanceof Buffer) {
         throw new Error(
-            'keys that don\'t end with \'-bin\' must have String values');
+          "keys that don't end with '-bin' must have String values"
+        );
       }
       if (!isLegalNonBinaryValue(value)) {
         throw new Error(
-            'Metadata string value "' + value +
-            '" contains illegal characters');
+          'Metadata string value "' + value + '" contains illegal characters'
+        );
       }
     }
   }
+}
+
+export interface MetadataOptions {
+  /* Signal that the request is idempotent. Defaults to false */
+  idempotentRequest?: boolean;
+  /* Signal that the call should not return UNAVAILABLE before it has
+   * started. Defaults to false. */
+  waitForReady?: boolean;
+  /* Signal that the call is cacheable. GRPC is free to use GET verb.
+   * Defaults to false */
+  cacheableRequest?: boolean;
+  /* Signal that the initial metadata should be corked. Defaults to false. */
+  corked?: boolean;
 }
 
 /**
@@ -66,6 +86,15 @@ function validate(key: string, value?: MetadataValue): void {
  */
 export class Metadata {
   protected internalRepr: MetadataObject = new Map<string, MetadataValue[]>();
+  private options: MetadataOptions;
+
+  constructor(options?: MetadataOptions) {
+    if (options === undefined) {
+      this.options = {};
+    } else {
+      this.options = options;
+    }
+  }
 
   /**
    * Sets the given value for the given key by replacing any other values
@@ -91,7 +120,9 @@ export class Metadata {
     key = normalizeKey(key);
     validate(key, value);
 
-    const existingValue: MetadataValue[]|undefined = this.internalRepr.get(key);
+    const existingValue: MetadataValue[] | undefined = this.internalRepr.get(
+      key
+    );
 
     if (existingValue === undefined) {
       this.internalRepr.set(key, [value]);
@@ -126,8 +157,8 @@ export class Metadata {
    * This reflects the most common way that people will want to see metadata.
    * @return A key/value mapping of the metadata.
    */
-  getMap(): {[key: string]: MetadataValue} {
-    const result: {[key: string]: MetadataValue} = {};
+  getMap(): { [key: string]: MetadataValue } {
+    const result: { [key: string]: MetadataValue } = {};
 
     this.internalRepr.forEach((values, key) => {
       if (values.length > 0) {
@@ -143,11 +174,11 @@ export class Metadata {
    * @return The newly cloned object.
    */
   clone(): Metadata {
-    const newMetadata = new Metadata();
+    const newMetadata = new Metadata(this.options);
     const newInternalRepr = newMetadata.internalRepr;
 
     this.internalRepr.forEach((value, key) => {
-      const clonedValue: MetadataValue[] = value.map(v => {
+      const clonedValue: MetadataValue[] = value.map((v) => {
         if (v instanceof Buffer) {
           return Buffer.from(v);
         } else {
@@ -170,11 +201,20 @@ export class Metadata {
    */
   merge(other: Metadata): void {
     other.internalRepr.forEach((values, key) => {
-      const mergedValue: MetadataValue[] =
-          (this.internalRepr.get(key) || []).concat(values);
+      const mergedValue: MetadataValue[] = (
+        this.internalRepr.get(key) || []
+      ).concat(values);
 
       this.internalRepr.set(key, mergedValue);
     });
+  }
+
+  setOptions(options: MetadataOptions) {
+    this.options = options;
+  }
+
+  getOptions(): MetadataOptions {
+    return this.options;
   }
 
   /**
@@ -217,24 +257,37 @@ export class Metadata {
 
       const values = headers[key];
 
-      if (isBinaryKey(key)) {
-        if (Array.isArray(values)) {
-          values.forEach((value) => {
-            result.add(key, Buffer.from(value, 'base64'));
-          });
-        } else if (values !== undefined) {
-          values.split(',').forEach(v => {
-            result.add(key, Buffer.from(v.trim(), 'base64'));
-          });
+      try {
+        if (isBinaryKey(key)) {
+          if (Array.isArray(values)) {
+            values.forEach((value) => {
+              result.add(key, Buffer.from(value, 'base64'));
+            });
+          } else if (values !== undefined) {
+            if (isCustomMetadata(key)) {
+              values.split(',').forEach((v) => {
+                result.add(key, Buffer.from(v.trim(), 'base64'));
+              });
+            } else {
+              result.add(key, Buffer.from(values, 'base64'));
+            }
+          }
+        } else {
+          if (Array.isArray(values)) {
+            values.forEach((value) => {
+              result.add(key, value);
+            });
+          } else if (values !== undefined) {
+            if (isCustomMetadata(key)) {
+              values.split(',').forEach((v) => result.add(key, v.trim()));
+            } else {
+              result.add(key, values);
+            }
+          }
         }
-      } else {
-        if (Array.isArray(values)) {
-          values.forEach((value) => {
-            result.add(key, value);
-          });
-        } else if (values !== undefined) {
-          values.split(',').forEach(v => result.add(key, v.trim()));
-        }
+      } catch (error) {
+        const message = `Failed to add metadata entry ${key}: ${values}. ${error.message}. For more information see https://github.com/grpc/grpc-node/issues/1173`;
+        log(LogVerbosity.ERROR, message);
       }
     });
     return result;

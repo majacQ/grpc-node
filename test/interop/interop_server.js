@@ -18,6 +18,7 @@
 
 'use strict';
 
+var assert = require('assert');
 var fs = require('fs');
 var path = require('path');
 var _ = require('lodash');
@@ -199,12 +200,16 @@ function handleHalfDuplex(call) {
  * Get a server object bound to the given port
  * @param {string} port Port to which to bind
  * @param {boolean} tls Indicates that the bound port should use TLS
- * @return {{server: Server, port: number}} Server object bound to the support,
- *     and port number that the server is bound to
+ * @param {function(Error, {{server: Server, port: number}})} callback Callback
+ *     to call with result or error
+ * @param {object?} options Optional additional options to use when
+ *     constructing the server
  */
-function getServer(port, tls) {
+function getServer(port, tls, callback, options) {
   // TODO(mlumish): enable TLS functionality
-  var options = {};
+  if (!options) {
+    options = {};
+  }
   var server_creds;
   if (tls) {
     var key_path = path.join(__dirname, '../data/server1.key');
@@ -227,8 +232,13 @@ function getServer(port, tls) {
     fullDuplexCall: handleFullDuplex,
     halfDuplexCall: handleHalfDuplex
   });
-  var port_num = server.bind('0.0.0.0:' + port, server_creds);
-  return {server: server, port: port_num};
+  server.bindAsync('0.0.0.0:' + port, server_creds, (err, port_num) => {
+    if (err) {
+      return callback(err);
+    }
+
+    callback(null, {server: server, port: port_num});
+  });
 }
 
 if (require.main === module) {
@@ -236,9 +246,11 @@ if (require.main === module) {
   var argv = parseArgs(process.argv, {
     string: ['port', 'use_tls']
   });
-  var server_obj = getServer(argv.port, argv.use_tls === 'true');
-  console.log('Server attaching to port ' + argv.port);
-  server_obj.server.start();
+  getServer(argv.port, argv.use_tls === 'true', (err, server_obj) => {
+    assert.ifError(err);
+    console.log('Server attaching to port ' + argv.port);
+    server_obj.server.start();
+  });
 }
 
 /**

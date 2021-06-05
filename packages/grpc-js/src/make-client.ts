@@ -15,28 +15,48 @@
  *
  */
 
-import {ChannelCredentials} from './channel-credentials';
-import {ChannelOptions} from './channel-options';
-import {Client} from './client';
+import { ChannelCredentials } from './channel-credentials';
+import { ChannelOptions } from './channel-options';
+import { Client } from './client';
+import { UntypedServiceImplementation } from './server';
 
-export interface Serialize<T> { (value: T): Buffer; }
+export interface Serialize<T> {
+  (value: T): Buffer;
+}
 
-export interface Deserialize<T> { (bytes: Buffer): T; }
+export interface Deserialize<T> {
+  (bytes: Buffer): T;
+}
 
-export interface MethodDefinition<RequestType, ResponseType> {
+export interface ClientMethodDefinition<RequestType, ResponseType> {
   path: string;
   requestStream: boolean;
   responseStream: boolean;
   requestSerialize: Serialize<RequestType>;
-  responseSerialize: Serialize<ResponseType>;
-  requestDeserialize: Deserialize<RequestType>;
   responseDeserialize: Deserialize<ResponseType>;
   originalName?: string;
 }
 
-export interface ServiceDefinition {
-  [index: string]: MethodDefinition<object, object>;
+export interface ServerMethodDefinition<RequestType, ResponseType> {
+  path: string;
+  requestStream: boolean;
+  responseStream: boolean;
+  responseSerialize: Serialize<ResponseType>;
+  requestDeserialize: Deserialize<RequestType>;
+  originalName?: string;
 }
+
+export interface MethodDefinition<RequestType, ResponseType>
+  extends ClientMethodDefinition<RequestType, ResponseType>,
+    ServerMethodDefinition<RequestType, ResponseType> {}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export type ServiceDefinition<
+  ImplementationType = UntypedServiceImplementation
+> = {
+  readonly [index in keyof ImplementationType]: MethodDefinition<any, any>;
+};
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 export interface ProtobufTypeDefinition {
   format: string;
@@ -45,7 +65,7 @@ export interface ProtobufTypeDefinition {
 }
 
 export interface PackageDefinition {
-  [index: string]: ServiceDefinition|ProtobufTypeDefinition;
+  [index: string]: ServiceDefinition | ProtobufTypeDefinition;
 }
 
 /**
@@ -57,7 +77,7 @@ const requesterFuncs = {
   unary: Client.prototype.makeUnaryRequest,
   server_stream: Client.prototype.makeServerStreamRequest,
   client_stream: Client.prototype.makeClientStreamRequest,
-  bidi: Client.prototype.makeBidiStreamRequest
+  bidi: Client.prototype.makeBidiStreamRequest,
 };
 
 export interface ServiceClient extends Client {
@@ -65,8 +85,11 @@ export interface ServiceClient extends Client {
 }
 
 export interface ServiceClientConstructor {
-  new(address: string, credentials: ChannelCredentials,
-      options?: Partial<ChannelOptions>): ServiceClient;
+  new (
+    address: string,
+    credentials: ChannelCredentials,
+    options?: Partial<ChannelOptions>
+  ): ServiceClient;
   service: ServiceDefinition;
 }
 
@@ -85,8 +108,10 @@ export interface ServiceClientConstructor {
  *     {@link grpc.Client}, and has the same arguments as that constructor.
  */
 export function makeClientConstructor(
-    methods: ServiceDefinition, serviceName: string,
-    classOptions?: {}): ServiceClientConstructor {
+  methods: ServiceDefinition,
+  serviceName: string,
+  classOptions?: {}
+): ServiceClientConstructor {
   if (!classOptions) {
     classOptions = {};
   }
@@ -118,14 +143,18 @@ export function makeClientConstructor(
     }
     const serialize = attrs.requestSerialize;
     const deserialize = attrs.responseDeserialize;
-    const methodFunc =
-        partial(requesterFuncs[methodType], attrs.path, serialize, deserialize);
+    const methodFunc = partial(
+      requesterFuncs[methodType],
+      attrs.path,
+      serialize,
+      deserialize
+    );
     ServiceClientImpl.prototype[name] = methodFunc;
     // Associate all provided attributes with the method
     Object.assign(ServiceClientImpl.prototype[name], attrs);
     if (attrs.originalName) {
       ServiceClientImpl.prototype[attrs.originalName] =
-          ServiceClientImpl.prototype[name];
+        ServiceClientImpl.prototype[name];
     }
   });
 
@@ -135,21 +164,27 @@ export function makeClientConstructor(
 }
 
 function partial(
-    fn: Function, path: string, serialize: Function,
-    deserialize: Function): Function {
-  // tslint:disable-next-line:no-any
-  return function(this: any, ...args: any[]) {
+  fn: Function,
+  path: string,
+  serialize: Function,
+  deserialize: Function
+): Function {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return function (this: any, ...args: any[]) {
     return fn.call(this, path, serialize, deserialize, ...args);
   };
 }
 
-export type GrpcObject = {
-  [index: string]: GrpcObject|ServiceClientConstructor|ProtobufTypeDefinition;
-};
+export interface GrpcObject {
+  [index: string]:
+    | GrpcObject
+    | ServiceClientConstructor
+    | ProtobufTypeDefinition;
+}
 
 function isProtobufTypeDefinition(
-    obj: ServiceDefinition|
-    ProtobufTypeDefinition): obj is ProtobufTypeDefinition {
+  obj: ServiceDefinition | ProtobufTypeDefinition
+): obj is ProtobufTypeDefinition {
   return 'format' in obj;
 }
 
@@ -158,11 +193,12 @@ function isProtobufTypeDefinition(
  * @param packageDef The package definition object.
  * @return The resulting gRPC object.
  */
-export function loadPackageDefinition(packageDef: PackageDefinition):
-    GrpcObject {
+export function loadPackageDefinition(
+  packageDef: PackageDefinition
+): GrpcObject {
   const result: GrpcObject = {};
   for (const serviceFqn in packageDef) {
-    if (packageDef.hasOwnProperty(serviceFqn)) {
+    if (Object.prototype.hasOwnProperty.call(packageDef, serviceFqn)) {
       const service = packageDef[serviceFqn];
       const nameComponents = serviceFqn.split('.');
       const serviceName = nameComponents[nameComponents.length - 1];

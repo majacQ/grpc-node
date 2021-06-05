@@ -15,54 +15,50 @@
  *
  */
 
-import {EventEmitter} from 'events';
-import * as http2 from 'http2';
-import {checkServerIdentity, PeerCertificate} from 'tls';
-import * as url from 'url';
-
-import {CallCredentialsFilterFactory} from './call-credentials-filter';
-import {Call, CallStreamOptions, Deadline, Http2CallStream} from './call-stream';
-import {ChannelCredentials} from './channel-credentials';
-import {ChannelOptions, recognizedOptions} from './channel-options';
-import {CompressionFilterFactory} from './compression-filter';
-import {Status} from './constants';
-import {DeadlineFilterFactory} from './deadline-filter';
-import {FilterStackFactory} from './filter-stack';
-import {Metadata} from './metadata';
-import {MetadataStatusFilterFactory} from './metadata-status-filter';
-import {Http2SubChannel} from './subchannel';
-
-const {version: clientVersion} = require('../../package.json');
-
-const MIN_CONNECT_TIMEOUT_MS = 20000;
-const INITIAL_BACKOFF_MS = 1000;
-const BACKOFF_MULTIPLIER = 1.6;
-const MAX_BACKOFF_MS = 120000;
-const BACKOFF_JITTER = 0.2;
-
-const {
-  HTTP2_HEADER_AUTHORITY,
-  HTTP2_HEADER_CONTENT_TYPE,
-  HTTP2_HEADER_METHOD,
-  HTTP2_HEADER_PATH,
-  HTTP2_HEADER_TE,
-  HTTP2_HEADER_USER_AGENT
-} = http2.constants;
+import {
+  Deadline,
+  Call,
+  Http2CallStream,
+  CallStreamOptions,
+} from './call-stream';
+import { ChannelCredentials } from './channel-credentials';
+import { ChannelOptions } from './channel-options';
+import { ResolvingLoadBalancer } from './resolving-load-balancer';
+import { SubchannelPool, getSubchannelPool } from './subchannel-pool';
+import { ChannelControlHelper } from './load-balancer';
+import { UnavailablePicker, Picker, PickResultType } from './picker';
+import { Metadata } from './metadata';
+import { Status, LogVerbosity } from './constants';
+import { FilterStackFactory } from './filter-stack';
+import { CallCredentialsFilterFactory } from './call-credentials-filter';
+import { DeadlineFilterFactory } from './deadline-filter';
+import { CompressionFilterFactory } from './compression-filter';
+import { getDefaultAuthority, mapUriDefaultScheme } from './resolver';
+import { ServiceConfig, validateServiceConfig } from './service-config';
+import { trace, log } from './logging';
+import { SubchannelAddress } from './subchannel';
+import { MaxMessageSizeFilterFactory } from './max-message-size-filter';
+import { mapProxyName } from './http_proxy';
+import { GrpcUri, parseUri, uriToString } from './uri-parser';
 
 export enum ConnectivityState {
   CONNECTING,
   READY,
   TRANSIENT_FAILURE,
   IDLE,
-  SHUTDOWN
+  SHUTDOWN,
 }
 
-function uniformRandom(min: number, max: number) {
-  return Math.random() * (max - min) + min;
-}
+let nextCallNumber = 0;
 
-// todo: maybe we want an interface for load balancing, but no implementation
-// for anything complicated
+function getNewCallNumber(): number {
+  const callNumber = nextCallNumber;
+  nextCallNumber += 1;
+  if (nextCallNumber >= Number.MAX_SAFE_INTEGER) {
+    nextCallNumber = 0;
+  }
+  return callNumber;
+}
 
 /**
  * An interface that represents a communication channel to a server specified
@@ -98,8 +94,10 @@ export interface Channel {
    *     error if the deadline passes without a state change.
    */
   watchConnectivityState(
-      currentState: ConnectivityState, deadline: Date|number,
-      callback: (error?: Error) => void): void;
+    currentState: ConnectivityState,
+    deadline: Date | number,
+    callback: (error?: Error) => void
+  ): void;
   /**
    * Create a call object. Call is an opaque type that is used by the Client
    * class. This function is called by the gRPC library when starting a
@@ -113,314 +111,419 @@ export interface Channel {
    *     that indicates what information to propagate from parentCall.
    */
   createCall(
-      method: string, deadline: Deadline|null|undefined,
-      host: string|null|undefined, parentCall: Call|null|undefined,
-      propagateFlags: number|null|undefined): Call;
+    method: string,
+    deadline: Deadline,
+    host: string | null | undefined,
+    parentCall: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+    propagateFlags: number | null | undefined
+  ): Call;
 }
 
-export class Http2Channel extends EventEmitter implements Channel {
-  private readonly userAgent: string;
-  private readonly target: url.URL;
-  private readonly defaultAuthority: string;
+interface ConnectivityStateWatcher {
+  currentState: ConnectivityState;
+  timer: NodeJS.Timeout;
+  callback: (error?: Error) => void;
+}
+
+export class ChannelImplementation implements Channel {
+  private resolvingLoadBalancer: ResolvingLoadBalancer;
+  private subchannelPool: SubchannelPool;
   private connectivityState: ConnectivityState = ConnectivityState.IDLE;
-  // Helper Promise object only used in the implementation of connect().
-  private connecting: Promise<void>|null = null;
-  /* For now, we have up to one subchannel, which will exist as long as we are
-   * connecting or trying to connect */
-  private subChannel: Http2SubChannel|null = null;
+  private currentPicker: Picker = new UnavailablePicker();
+  private pickQueue: Array<{
+    callStream: Http2CallStream;
+    callMetadata: Metadata;
+  }> = [];
+  private connectivityStateWatchers: ConnectivityStateWatcher[] = [];
+  private defaultAuthority: string;
   private filterStackFactory: FilterStackFactory;
-
-  private subChannelConnectCallback: () => void = () => {};
-  private subChannelCloseCallback: () => void = () => {};
-
-  private backoffTimerId: NodeJS.Timer;
-  private currentBackoff: number = INITIAL_BACKOFF_MS;
-  private currentBackoffDeadline: Date;
-
-  private handleStateChange(
-      oldState: ConnectivityState, newState: ConnectivityState): void {
-    const now: Date = new Date();
-    switch (newState) {
-      case ConnectivityState.CONNECTING:
-        if (oldState === ConnectivityState.IDLE) {
-          this.currentBackoff = INITIAL_BACKOFF_MS;
-          this.currentBackoffDeadline =
-              new Date(now.getTime() + INITIAL_BACKOFF_MS);
-        } else if (oldState === ConnectivityState.TRANSIENT_FAILURE) {
-          this.currentBackoff = Math.min(
-              this.currentBackoff * BACKOFF_MULTIPLIER, MAX_BACKOFF_MS);
-          const jitterMagnitude: number = BACKOFF_JITTER * this.currentBackoff;
-          this.currentBackoffDeadline = new Date(
-              now.getTime() + this.currentBackoff +
-              uniformRandom(-jitterMagnitude, jitterMagnitude));
-        }
-        this.startConnecting();
-        break;
-      case ConnectivityState.READY:
-        this.emit('connect');
-        break;
-      case ConnectivityState.TRANSIENT_FAILURE:
-        this.subChannel = null;
-        this.backoffTimerId = setTimeout(() => {
-          this.transitionToState(
-              [ConnectivityState.TRANSIENT_FAILURE],
-              ConnectivityState.CONNECTING);
-        }, this.currentBackoffDeadline.getTime() - now.getTime());
-        break;
-      case ConnectivityState.IDLE:
-      case ConnectivityState.SHUTDOWN:
-        if (this.subChannel) {
-          this.subChannel.close();
-          this.subChannel.removeListener(
-              'connect', this.subChannelConnectCallback);
-          this.subChannel.removeListener('close', this.subChannelCloseCallback);
-          this.subChannel = null;
-          this.emit('shutdown');
-          clearTimeout(this.backoffTimerId);
-        }
-        break;
-      default:
-        throw new Error('This should never happen');
-    }
-  }
-
-  // Transition from any of a set of oldStates to a specific newState
-  private transitionToState(
-      oldStates: ConnectivityState[], newState: ConnectivityState): void {
-    if (oldStates.indexOf(this.connectivityState) > -1) {
-      const oldState: ConnectivityState = this.connectivityState;
-      this.connectivityState = newState;
-      this.handleStateChange(oldState, newState);
-      this.emit('connectivityStateChanged', newState);
-    }
-  }
-
-  private startConnecting(): void {
-    const connectionOptions: http2.SecureClientSessionOptions =
-        this.credentials._getConnectionOptions() || {};
-    if (connectionOptions.secureContext !== null) {
-      // If provided, the value of grpc.ssl_target_name_override should be used
-      // to override the target hostname when checking server identity.
-      // This option is used for testing only.
-      if (this.options['grpc.ssl_target_name_override']) {
-        const sslTargetNameOverride =
-            this.options['grpc.ssl_target_name_override']!;
-        connectionOptions.checkServerIdentity =
-            (host: string, cert: PeerCertificate): Error|undefined => {
-              return checkServerIdentity(sslTargetNameOverride, cert);
-            };
-        connectionOptions.servername = sslTargetNameOverride;
-      }
-    }
-    const subChannel: Http2SubChannel = new Http2SubChannel(
-        this.target, connectionOptions, this.userAgent, this.options);
-    this.subChannel = subChannel;
-    const now = new Date();
-    const connectionTimeout: number = Math.max(
-        this.currentBackoffDeadline.getTime() - now.getTime(),
-        MIN_CONNECT_TIMEOUT_MS);
-    const connectionTimerId: NodeJS.Timer = setTimeout(() => {
-      // This should trigger the 'close' event, which will send us back to
-      // TRANSIENT_FAILURE
-      subChannel.close();
-    }, connectionTimeout);
-    this.subChannelConnectCallback = () => {
-      // Connection succeeded
-      clearTimeout(connectionTimerId);
-      this.transitionToState(
-          [ConnectivityState.CONNECTING], ConnectivityState.READY);
-    };
-    subChannel.once('connect', this.subChannelConnectCallback);
-    this.subChannelCloseCallback = () => {
-      // Connection failed
-      clearTimeout(connectionTimerId);
-      /* TODO(murgatroid99): verify that this works for
-       * CONNECTING->TRANSITIVE_FAILURE see nodejs/node#16645 */
-      this.transitionToState(
-          [ConnectivityState.CONNECTING, ConnectivityState.READY],
-          ConnectivityState.TRANSIENT_FAILURE);
-    };
-    subChannel.once('close', this.subChannelCloseCallback);
-  }
-
+  private target: GrpcUri;
   constructor(
-      address: string, readonly credentials: ChannelCredentials,
-      private readonly options: Partial<ChannelOptions>) {
-    super();
-    for (const option in options) {
-      if (options.hasOwnProperty(option)) {
-        if (!recognizedOptions.hasOwnProperty(option)) {
-          console.warn(
-              `Unrecognized channel argument '${option}' will be ignored.`);
-        }
+    target: string,
+    private readonly credentials: ChannelCredentials,
+    private readonly options: ChannelOptions
+  ) {
+    if (typeof target !== 'string') {
+      throw new TypeError('Channel target must be a string');
+    }
+    if (!(credentials instanceof ChannelCredentials)) {
+      throw new TypeError(
+        'Channel credentials must be a ChannelCredentials object'
+      );
+    }
+    if (options) {
+      if (
+        typeof options !== 'object' ||
+        !Object.values(options).every(
+          (value) =>
+            typeof value === 'string' ||
+            typeof value === 'number' ||
+            typeof value === 'undefined'
+        )
+      ) {
+        throw new TypeError(
+          'Channel options must be an object with string or number values'
+        );
       }
     }
-    if (credentials._isSecure()) {
-      this.target = new url.URL(`https://${address}`);
-    } else {
-      this.target = new url.URL(`http://${address}`);
+    const originalTargetUri = parseUri(target);
+    if (originalTargetUri === null) {
+      throw new Error(`Could not parse target name "${target}"`);
     }
-    // TODO(murgatroid99): Add more centralized handling of channel options
+    /* This ensures that the target has a scheme that is registered with the
+     * resolver */
+    const defaultSchemeMapResult = mapUriDefaultScheme(originalTargetUri);
+    if (defaultSchemeMapResult === null) {
+      throw new Error(
+        `Could not find a default scheme for target name "${target}"`
+      );
+    }
     if (this.options['grpc.default_authority']) {
       this.defaultAuthority = this.options['grpc.default_authority'] as string;
     } else {
-      this.defaultAuthority = this.target.host;
+      this.defaultAuthority = getDefaultAuthority(defaultSchemeMapResult);
     }
-    this.filterStackFactory = new FilterStackFactory([
-      new CallCredentialsFilterFactory(this), new DeadlineFilterFactory(this),
-      new MetadataStatusFilterFactory(this), new CompressionFilterFactory(this)
-    ]);
-    this.currentBackoffDeadline = new Date();
-    /* The only purpose of these lines is to ensure that this.backoffTimerId has
-     * a value of type NodeJS.Timer. */
-    this.backoffTimerId = setTimeout(() => {}, 0);
+    const proxyMapResult = mapProxyName(defaultSchemeMapResult, options);
+    this.target = proxyMapResult.target;
+    this.options = Object.assign({}, this.options, proxyMapResult.extraOptions);
 
-    // Build user-agent string.
-    this.userAgent = [
-      options['grpc.primary_user_agent'], `grpc-node-js/${clientVersion}`,
-      options['grpc.secondary_user_agent']
-    ].filter(e => e).join(' ');  // remove falsey values first
-  }
-
-  _startHttp2Stream(
-      authority: string, methodName: string, stream: Http2CallStream,
-      metadata: Metadata) {
-    const finalMetadata: Promise<Metadata> =
-        stream.filterStack.sendMetadata(Promise.resolve(metadata.clone()));
-    Promise.all([finalMetadata, this.connect()])
-        .then(([metadataValue]) => {
-          const headers = metadataValue.toHttp2Headers();
-          headers[HTTP2_HEADER_AUTHORITY] = authority;
-          headers[HTTP2_HEADER_USER_AGENT] = this.userAgent;
-          headers[HTTP2_HEADER_CONTENT_TYPE] = 'application/grpc';
-          headers[HTTP2_HEADER_METHOD] = 'POST';
-          headers[HTTP2_HEADER_PATH] = methodName;
-          headers[HTTP2_HEADER_TE] = 'trailers';
-          if (this.connectivityState === ConnectivityState.READY) {
-            const subChannel: Http2SubChannel = this.subChannel!;
-            subChannel.startCallStream(metadataValue, stream);
-          } else {
-            /* In this case, we lost the connection while finalizing
-             * metadata. That should be very unusual */
-            setImmediate(() => {
-              this._startHttp2Stream(authority, methodName, stream, metadata);
-            });
-          }
-        })
-        .catch((error: Error&{code: number}) => {
-          // We assume the error code isn't 0 (Status.OK)
-          stream.cancelWithStatus(
-              error.code || Status.UNKNOWN,
-              `Getting metadata from plugin failed with error: ${
-                  error.message}`);
-        });
-  }
-
-  createCall(
-      method: string, deadline: Deadline|null|undefined,
-      host: string|null|undefined, parentCall: Call|null|undefined,
-      propagateFlags: number|null|undefined): Call {
-    if (this.connectivityState === ConnectivityState.SHUTDOWN) {
-      throw new Error('Channel has been shut down');
-    }
-    const finalOptions: CallStreamOptions = {
-      deadline: (deadline === null || deadline === undefined) ? Infinity :
-                                                                deadline,
-      flags: propagateFlags || 0,
-      host: host || this.defaultAuthority,
-      parentCall: parentCall || null
+    /* The global boolean parameter to getSubchannelPool has the inverse meaning to what
+     * the grpc.use_local_subchannel_pool channel option means. */
+    this.subchannelPool = getSubchannelPool(
+      (options['grpc.use_local_subchannel_pool'] ?? 0) === 0
+    );
+    const channelControlHelper: ChannelControlHelper = {
+      createSubchannel: (
+        subchannelAddress: SubchannelAddress,
+        subchannelArgs: ChannelOptions
+      ) => {
+        return this.subchannelPool.getOrCreateSubchannel(
+          this.target,
+          subchannelAddress,
+          Object.assign({}, this.options, subchannelArgs),
+          this.credentials
+        );
+      },
+      updateState: (connectivityState: ConnectivityState, picker: Picker) => {
+        this.currentPicker = picker;
+        const queueCopy = this.pickQueue.slice();
+        this.pickQueue = [];
+        for (const { callStream, callMetadata } of queueCopy) {
+          this.tryPick(callStream, callMetadata);
+        }
+        this.updateState(connectivityState);
+      },
+      requestReresolution: () => {
+        // This should never be called.
+        throw new Error(
+          'Resolving load balancer should never call requestReresolution'
+        );
+      },
     };
-    const stream: Http2CallStream = new Http2CallStream(
-        method, this, finalOptions, this.filterStackFactory);
-    return stream;
+    // TODO(murgatroid99): check channel arg for default service config
+    let defaultServiceConfig: ServiceConfig = {
+      loadBalancingConfig: [],
+      methodConfig: [],
+    };
+    if (options['grpc.service_config']) {
+      defaultServiceConfig = validateServiceConfig(
+        JSON.parse(options['grpc.service_config']!)
+      );
+    }
+    this.resolvingLoadBalancer = new ResolvingLoadBalancer(
+      this.target,
+      channelControlHelper,
+      defaultServiceConfig
+    );
+    this.filterStackFactory = new FilterStackFactory([
+      new CallCredentialsFilterFactory(this),
+      new DeadlineFilterFactory(this),
+      new MaxMessageSizeFilterFactory(this.options),
+      new CompressionFilterFactory(this),
+    ]);
   }
 
   /**
-   * Attempts to connect, returning a Promise that resolves when the connection
-   * is successful, or rejects if the channel is shut down.
+   * Check the picker output for the given call and corresponding metadata,
+   * and take any relevant actions. Should not be called while iterating
+   * over pickQueue.
+   * @param callStream
+   * @param callMetadata
    */
-  private connect(): Promise<void> {
-    if (this.connectivityState === ConnectivityState.READY) {
-      return Promise.resolve();
-    } else if (this.connectivityState === ConnectivityState.SHUTDOWN) {
-      return Promise.reject(new Error('Channel has been shut down'));
-    } else {
-      // In effect, this.connecting is only assigned upon the first attempt to
-      // transition from IDLE to CONNECTING, so this condition could have also
-      // been (connectivityState === IDLE).
-      if (!this.connecting) {
-        this.connecting = new Promise((resolve, reject) => {
-          this.transitionToState(
-              [ConnectivityState.IDLE], ConnectivityState.CONNECTING);
-          const onConnect = () => {
-            this.connecting = null;
-            this.removeListener('shutdown', onShutdown);
-            resolve();
-          };
-          const onShutdown = () => {
-            this.connecting = null;
-            this.removeListener('connect', onConnect);
-            reject(new Error('Channel has been shut down'));
-          };
-          this.once('connect', onConnect);
-          this.once('shutdown', onShutdown);
-        });
-      }
-      return this.connecting;
+  private tryPick(callStream: Http2CallStream, callMetadata: Metadata) {
+    const pickResult = this.currentPicker.pick({ metadata: callMetadata });
+    trace(
+      LogVerbosity.DEBUG,
+      'channel',
+      'Pick result: ' +
+        PickResultType[pickResult.pickResultType] +
+        ' subchannel: ' +
+        pickResult.subchannel?.getAddress() +
+        ' status: ' +
+        pickResult.status?.code +
+        ' ' +
+        pickResult.status?.details
+    );
+    switch (pickResult.pickResultType) {
+      case PickResultType.COMPLETE:
+        if (pickResult.subchannel === null) {
+          callStream.cancelWithStatus(
+            Status.UNAVAILABLE,
+            'Request dropped by load balancing policy'
+          );
+          // End the call with an error
+        } else {
+          /* If the subchannel is not in the READY state, that indicates a bug
+           * somewhere in the load balancer or picker. So, we log an error and
+           * queue the pick to be tried again later. */
+          if (
+            pickResult.subchannel!.getConnectivityState() !==
+            ConnectivityState.READY
+          ) {
+            log(
+              LogVerbosity.ERROR,
+              'Error: COMPLETE pick result subchannel ' +
+                pickResult.subchannel!.getAddress() +
+                ' has state ' +
+                ConnectivityState[pickResult.subchannel!.getConnectivityState()]
+            );
+            this.pickQueue.push({ callStream, callMetadata });
+            break;
+          }
+          /* We need to clone the callMetadata here because the transparent
+           * retry code in the promise resolution handler use the same
+           * callMetadata object, so it needs to stay unmodified */
+          callStream.filterStack
+            .sendMetadata(Promise.resolve(callMetadata.clone()))
+            .then(
+              (finalMetadata) => {
+                const subchannelState: ConnectivityState = pickResult.subchannel!.getConnectivityState();
+                if (subchannelState === ConnectivityState.READY) {
+                  try {
+                    pickResult.subchannel!.startCallStream(
+                      finalMetadata,
+                      callStream,
+                      pickResult.extraFilterFactory ?? undefined
+                    );
+                    /* If we reach this point, the call stream has started
+                     * successfully */
+                    pickResult.onCallStarted?.();
+                  } catch (error) {
+                    if (
+                      (error as NodeJS.ErrnoException).code ===
+                      'ERR_HTTP2_GOAWAY_SESSION'
+                    ) {
+                      /* An error here indicates that something went wrong with
+                       * the picked subchannel's http2 stream right before we
+                       * tried to start the stream. We are handling a promise
+                       * result here, so this is asynchronous with respect to the
+                       * original tryPick call, so calling it again is not
+                       * recursive. We call tryPick immediately instead of
+                       * queueing this pick again because handling the queue is
+                       * triggered by state changes, and we want to immediately
+                       * check if the state has already changed since the
+                       * previous tryPick call. We do this instead of cancelling
+                       * the stream because the correct behavior may be
+                       * re-queueing instead, based on the logic in the rest of
+                       * tryPick */
+                      trace(
+                        LogVerbosity.INFO,
+                        'channel',
+                        'Failed to start call on picked subchannel ' +
+                          pickResult.subchannel!.getAddress() +
+                          ' with error ' +
+                          (error as Error).message +
+                          '. Retrying pick'
+                      );
+                      this.tryPick(callStream, callMetadata);
+                    } else {
+                      trace(
+                        LogVerbosity.INFO,
+                        'channel',
+                        'Failed to start call on picked subchanel ' +
+                          pickResult.subchannel!.getAddress() +
+                          ' with error ' +
+                          (error as Error).message +
+                          '. Ending call'
+                      );
+                      callStream.cancelWithStatus(
+                        Status.INTERNAL,
+                        'Failed to start HTTP/2 stream'
+                      );
+                    }
+                  }
+                } else {
+                  /* The logic for doing this here is the same as in the catch
+                   * block above */
+                  trace(
+                    LogVerbosity.INFO,
+                    'channel',
+                    'Picked subchannel ' +
+                      pickResult.subchannel!.getAddress() +
+                      ' has state ' +
+                      ConnectivityState[subchannelState] +
+                      ' after metadata filters. Retrying pick'
+                  );
+                  this.tryPick(callStream, callMetadata);
+                }
+              },
+              (error: Error & { code: number }) => {
+                // We assume the error code isn't 0 (Status.OK)
+                callStream.cancelWithStatus(
+                  error.code || Status.UNKNOWN,
+                  `Getting metadata from plugin failed with error: ${error.message}`
+                );
+              }
+            );
+        }
+        break;
+      case PickResultType.QUEUE:
+        this.pickQueue.push({ callStream, callMetadata });
+        break;
+      case PickResultType.TRANSIENT_FAILURE:
+        if (callMetadata.getOptions().waitForReady) {
+          this.pickQueue.push({ callStream, callMetadata });
+        } else {
+          callStream.cancelWithStatus(
+            pickResult.status!.code,
+            pickResult.status!.details
+          );
+        }
+        break;
+      default:
+        throw new Error(
+          `Invalid state: unknown pickResultType ${pickResult.pickResultType}`
+        );
     }
   }
 
-  getConnectivityState(tryToConnect: boolean): ConnectivityState {
-    if (tryToConnect) {
-      this.transitionToState(
-          [ConnectivityState.IDLE], ConnectivityState.CONNECTING);
-    }
-    return this.connectivityState;
-  }
-
-  watchConnectivityState(
-      currentState: ConnectivityState, deadline: Date|number,
-      callback: (error?: Error) => void) {
-    if (this.connectivityState !== currentState) {
-      /* If the connectivity state is different from the provided currentState,
-       * we assume that a state change has successfully occurred */
-      setImmediate(callback);
-    } else {
-      let deadlineMs = 0;
-      if (deadline instanceof Date) {
-        deadlineMs = deadline.getTime();
-      } else {
-        deadlineMs = deadline;
-      }
-      let timeout: number = deadlineMs - Date.now();
-      if (timeout < 0) {
-        timeout = 0;
-      }
-      const timeoutId = setTimeout(() => {
-        this.removeListener('connectivityStateChanged', eventCb);
-        callback(new Error('Channel state did not change before deadline'));
-      }, timeout);
-      const eventCb = () => {
-        clearTimeout(timeoutId);
-        callback();
-      };
-      this.once('connectivityStateChanged', eventCb);
+  private removeConnectivityStateWatcher(
+    watcherObject: ConnectivityStateWatcher
+  ) {
+    const watcherIndex = this.connectivityStateWatchers.findIndex(
+      (value) => value === watcherObject
+    );
+    if (watcherIndex >= 0) {
+      this.connectivityStateWatchers.splice(watcherIndex, 1);
     }
   }
 
-  getTarget() {
-    return this.target.toString();
+  private updateState(newState: ConnectivityState): void {
+    trace(
+      LogVerbosity.DEBUG,
+      'connectivity_state',
+      uriToString(this.target) +
+        ' ' +
+        ConnectivityState[this.connectivityState] +
+        ' -> ' +
+        ConnectivityState[newState]
+    );
+    this.connectivityState = newState;
+    const watchersCopy = this.connectivityStateWatchers.slice();
+    for (const watcherObject of watchersCopy) {
+      if (newState !== watcherObject.currentState) {
+        clearTimeout(watcherObject.timer);
+        this.removeConnectivityStateWatcher(watcherObject);
+        watcherObject.callback();
+      }
+    }
+  }
+
+  _startCallStream(stream: Http2CallStream, metadata: Metadata) {
+    this.tryPick(stream, metadata.clone());
   }
 
   close() {
+    this.resolvingLoadBalancer.destroy();
+    this.updateState(ConnectivityState.SHUTDOWN);
+
+    this.subchannelPool.unrefUnusedSubchannels();
+  }
+
+  getTarget() {
+    return uriToString(this.target);
+  }
+
+  getConnectivityState(tryToConnect: boolean) {
+    const connectivityState = this.connectivityState;
+    if (tryToConnect) {
+      this.resolvingLoadBalancer.exitIdle();
+    }
+    return connectivityState;
+  }
+
+  watchConnectivityState(
+    currentState: ConnectivityState,
+    deadline: Date | number,
+    callback: (error?: Error) => void
+  ): void {
+    const deadlineDate: Date =
+      deadline instanceof Date ? deadline : new Date(deadline);
+    const now = new Date();
+    if (deadlineDate <= now) {
+      process.nextTick(
+        callback,
+        new Error('Deadline passed without connectivity state change')
+      );
+      return;
+    }
+    const watcherObject = {
+      currentState,
+      callback,
+      timer: setTimeout(() => {
+        this.removeConnectivityStateWatcher(watcherObject);
+        callback(
+          new Error('Deadline passed without connectivity state change')
+        );
+      }, deadlineDate.getTime() - now.getTime()),
+    };
+    this.connectivityStateWatchers.push(watcherObject);
+  }
+
+  createCall(
+    method: string,
+    deadline: Deadline,
+    host: string | null | undefined,
+    parentCall: any, // eslint-disable-line @typescript-eslint/no-explicit-any
+    propagateFlags: number | null | undefined
+  ): Call {
+    if (typeof method !== 'string') {
+      throw new TypeError('Channel#createCall: method must be a string');
+    }
+    if (!(typeof deadline === 'number' || deadline instanceof Date)) {
+      throw new TypeError(
+        'Channel#createCall: deadline must be a number or Date'
+      );
+    }
     if (this.connectivityState === ConnectivityState.SHUTDOWN) {
       throw new Error('Channel has been shut down');
     }
-    this.transitionToState(
-        [
-          ConnectivityState.CONNECTING, ConnectivityState.READY,
-          ConnectivityState.TRANSIENT_FAILURE, ConnectivityState.IDLE
-        ],
-        ConnectivityState.SHUTDOWN);
+    const callNumber = getNewCallNumber();
+    trace(
+      LogVerbosity.DEBUG,
+      'channel',
+      uriToString(this.target) +
+        ' createCall [' +
+        callNumber +
+        '] method="' +
+        method +
+        '", deadline=' +
+        deadline
+    );
+    const finalOptions: CallStreamOptions = {
+      deadline: deadline,
+      flags: propagateFlags || 0,
+      host: host || this.defaultAuthority,
+      parentCall: parentCall || null,
+    };
+    const stream: Http2CallStream = new Http2CallStream(
+      method,
+      this,
+      finalOptions,
+      this.filterStackFactory,
+      this.credentials._getCallCredentials(),
+      callNumber
+    );
+    return stream;
   }
 }

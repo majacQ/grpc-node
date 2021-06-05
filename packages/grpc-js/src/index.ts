@@ -17,33 +17,68 @@
 
 import * as semver from 'semver';
 
-import {ClientDuplexStream, ClientReadableStream, ClientUnaryCall, ClientWritableStream} from './call';
-import {CallCredentials} from './call-credentials';
-import {Deadline, StatusObject} from './call-stream';
-import {Channel, ConnectivityState, Http2Channel} from './channel';
-import {ChannelCredentials} from './channel-credentials';
-import {CallOptions, Client} from './client';
-import {LogVerbosity, Status} from './constants';
+import {
+  ClientDuplexStream,
+  ClientReadableStream,
+  ClientUnaryCall,
+  ClientWritableStream,
+  ServiceError,
+} from './call';
+import { CallCredentials, OAuth2Client } from './call-credentials';
+import { Deadline, StatusObject } from './call-stream';
+import { Channel, ConnectivityState, ChannelImplementation } from './channel';
+import { ChannelCredentials } from './channel-credentials';
+import {
+  CallOptions,
+  Client,
+  CallInvocationTransformer,
+  CallProperties,
+  UnaryCallback,
+} from './client';
+import { LogVerbosity, Status } from './constants';
 import * as logging from './logging';
-import {Deserialize, loadPackageDefinition, makeClientConstructor, Serialize} from './make-client';
-import {Metadata} from './metadata';
-import {StatusBuilder} from './status-builder';
+import {
+  Deserialize,
+  loadPackageDefinition,
+  makeClientConstructor,
+  MethodDefinition,
+  Serialize,
+  ServiceDefinition,
+} from './make-client';
+import { Metadata, MetadataValue } from './metadata';
+import {
+  Server,
+  UntypedHandleCall,
+  UntypedServiceImplementation,
+} from './server';
+import { KeyCertPair, ServerCredentials } from './server-credentials';
+import { StatusBuilder } from './status-builder';
+import {
+  handleBidiStreamingCall,
+  handleServerStreamingCall,
+  handleUnaryCall,
+  sendUnaryData,
+  ServerUnaryCall,
+  ServerReadableStream,
+  ServerWritableStream,
+  ServerDuplexStream,
+} from './server-call';
 
-const supportedNodeVersions = '^8.11.2 || >=9.4';
+const supportedNodeVersions = require('../../package.json').engines.node;
 if (!semver.satisfies(process.version, supportedNodeVersions)) {
   throw new Error(`@grpc/grpc-js only works on Node ${supportedNodeVersions}`);
 }
 
 interface IndexedObject {
-  [key: string]: any;  // tslint:disable-line no-any
-  [key: number]: any;  // tslint:disable-line no-any
+  [key: string]: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+  [key: number]: any; // eslint-disable-line @typescript-eslint/no-explicit-any
 }
 
 function mixin(...sources: IndexedObject[]) {
-  const result: {[key: string]: Function} = {};
+  const result: { [key: string]: Function } = {};
   for (const source of sources) {
     for (const propName of Object.getOwnPropertyNames(source)) {
-      const property: any = source[propName];  // tslint:disable-line no-any
+      const property: any = source[propName]; // eslint-disable-line @typescript-eslint/no-explicit-any
       if (typeof property === 'function') {
         result[propName] = property;
       }
@@ -52,96 +87,58 @@ function mixin(...sources: IndexedObject[]) {
   return result;
 }
 
-export interface OAuth2Client {
-  getRequestMetadata: (url: string, callback: (err: Error|null, headers?: {
-                                      Authorization: string
-                                    }) => void) => void;
-  getRequestHeaders: (url?: string) => Promise<{Authorization: string}>;
-}
+export { OAuth2Client };
 
 /**** Client Credentials ****/
 
 // Using assign only copies enumerable properties, which is what we want
 export const credentials = mixin(
-    {
-      /**
-       * Create a gRPC credential from a Google credential object.
-       * @param googleCredentials The authentication client to use.
-       * @return The resulting CallCredentials object.
-       */
-      createFromGoogleCredential: (
-          googleCredentials: OAuth2Client): CallCredentials => {
-        return CallCredentials.createFromMetadataGenerator(
-            (options, callback) => {
-              // google-auth-library pre-v2.0.0 does not have getRequestHeaders
-              // but has getRequestMetadata, which is deprecated in v2.0.0
-              let getHeaders: Promise<{Authorization: string}>;
-              if (typeof googleCredentials.getRequestHeaders === 'function') {
-                getHeaders =
-                    googleCredentials.getRequestHeaders(options.service_url);
-              } else {
-                getHeaders = new Promise((resolve, reject) => {
-                  googleCredentials.getRequestMetadata(
-                      options.service_url, (err, headers) => {
-                        if (err) {
-                          reject(err);
-                          return;
-                        }
-                        resolve(headers);
-                      });
-                });
-              }
-              getHeaders.then(
-                  headers => {
-                    const metadata = new Metadata();
-                    metadata.add('authorization', headers.Authorization);
-                    callback(null, metadata);
-                  },
-                  err => {
-                    callback(err);
-                  });
-            });
-      },
-
-      /**
-       * Combine a ChannelCredentials with any number of CallCredentials into a
-       * single ChannelCredentials object.
-       * @param channelCredentials The ChannelCredentials object.
-       * @param callCredentials Any number of CallCredentials objects.
-       * @return The resulting ChannelCredentials object.
-       */
-      combineChannelCredentials:
-          (channelCredentials: ChannelCredentials,
-           ...callCredentials: CallCredentials[]): ChannelCredentials => {
-            return callCredentials.reduce(
-                (acc, other) => acc.compose(other), channelCredentials);
-          },
-
-      /**
-       * Combine any number of CallCredentials into a single CallCredentials
-       * object.
-       * @param first The first CallCredentials object.
-       * @param additional Any number of additional CallCredentials objects.
-       * @return The resulting CallCredentials object.
-       */
-      combineCallCredentials: (
-          first: CallCredentials, ...additional: CallCredentials[]):
-          CallCredentials => {
-            return additional.reduce((acc, other) => acc.compose(other), first);
-          }
+  {
+    /**
+     * Combine a ChannelCredentials with any number of CallCredentials into a
+     * single ChannelCredentials object.
+     * @param channelCredentials The ChannelCredentials object.
+     * @param callCredentials Any number of CallCredentials objects.
+     * @return The resulting ChannelCredentials object.
+     */
+    combineChannelCredentials: (
+      channelCredentials: ChannelCredentials,
+      ...callCredentials: CallCredentials[]
+    ): ChannelCredentials => {
+      return callCredentials.reduce(
+        (acc, other) => acc.compose(other),
+        channelCredentials
+      );
     },
-    ChannelCredentials, CallCredentials);
+
+    /**
+     * Combine any number of CallCredentials into a single CallCredentials
+     * object.
+     * @param first The first CallCredentials object.
+     * @param additional Any number of additional CallCredentials objects.
+     * @return The resulting CallCredentials object.
+     */
+    combineCallCredentials: (
+      first: CallCredentials,
+      ...additional: CallCredentials[]
+    ): CallCredentials => {
+      return additional.reduce((acc, other) => acc.compose(other), first);
+    },
+  },
+  ChannelCredentials,
+  CallCredentials
+);
 
 /**** Metadata ****/
 
-export {Metadata};
+export { Metadata, MetadataValue };
 
 /**** Constants ****/
 
 export {
   LogVerbosity as logVerbosity,
   Status as status,
-  ConnectivityState as connectivityState
+  ConnectivityState as connectivityState,
   // TODO: Other constants as well
 };
 
@@ -152,7 +149,11 @@ export {
   loadPackageDefinition,
   makeClientConstructor,
   makeClientConstructor as makeGenericClientConstructor,
-  Http2Channel as Channel
+  CallProperties,
+  CallInvocationTransformer,
+  ChannelImplementation as Channel,
+  Channel as ChannelInterface,
+  UnaryCallback as requestCallback,
 };
 
 /**
@@ -161,14 +162,16 @@ export {
  */
 export const closeClient = (client: Client) => client.close();
 
-export const waitForClientReady =
-    (client: Client, deadline: Date|number,
-     callback: (error?: Error) => void) =>
-        client.waitForReady(deadline, callback);
+export const waitForClientReady = (
+  client: Client,
+  deadline: Date | number,
+  callback: (error?: Error) => void
+) => client.waitForReady(deadline, callback);
 
 /* Interfaces */
 
 export {
+  sendUnaryData,
   ChannelCredentials,
   CallCredentials,
   Deadline,
@@ -179,39 +182,44 @@ export {
   ClientWritableStream,
   ClientDuplexStream,
   CallOptions,
-  StatusObject
+  MethodDefinition,
+  StatusObject,
+  ServiceError,
+  ServerUnaryCall,
+  ServerReadableStream,
+  ServerWritableStream,
+  ServerDuplexStream,
+  ServiceDefinition,
+  UntypedHandleCall,
+  UntypedServiceImplementation,
 };
 
-/* tslint:disable:no-any */
-export type Call = ClientUnaryCall|ClientReadableStream<any>|
-    ClientWritableStream<any>|ClientDuplexStream<any, any>;
-/* tslint:enable:no-any */
+/**** Server ****/
 
-export type MetadataListener = (metadata: Metadata, next: Function) => void;
+export { handleBidiStreamingCall, handleServerStreamingCall, handleUnaryCall };
 
-// tslint:disable-next-line:no-any
-export type MessageListener = (message: any, next: Function) => void;
-
-export type StatusListener = (status: StatusObject, next: Function) => void;
-
-export interface Listener {
-  onReceiveMetadata?: MetadataListener;
-  onReceiveMessage?: MessageListener;
-  onReceiveStatus?: StatusListener;
-}
+/* eslint-disable @typescript-eslint/no-explicit-any */
+export type Call =
+  | ClientUnaryCall
+  | ClientReadableStream<any>
+  | ClientWritableStream<any>
+  | ClientDuplexStream<any, any>;
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 /**** Unimplemented function stubs ****/
 
-/* tslint:disable:no-any variable-name */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 export const loadObject = (value: any, options: any) => {
   throw new Error(
-      'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead');
+    'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead'
+  );
 };
 
 export const load = (filename: any, format: any, options: any) => {
   throw new Error(
-      'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead');
+    'Not available in this library. Use @grpc/proto-loader and loadPackageDefinition instead'
+  );
 };
 
 export const setLogger = (logger: Partial<Console>): void => {
@@ -222,34 +230,35 @@ export const setLogVerbosity = (verbosity: LogVerbosity): void => {
   logging.setLoggerVerbosity(verbosity);
 };
 
-export const Server = (options: any) => {
-  throw new Error('Not yet implemented');
-};
-
-export const ServerCredentials = {
-  createSsl:
-      (rootCerts: any, keyCertPairs: any, checkClientCertificate: any) => {
-        throw new Error('Not yet implemented');
-      },
-  createInsecure: () => {
-    throw new Error('Not yet implemented');
-  }
-};
+export { Server };
+export { ServerCredentials };
+export { KeyCertPair };
 
 export const getClientChannel = (client: Client) => {
   return Client.prototype.getChannel.call(client);
 };
 
-export {StatusBuilder};
+export { StatusBuilder };
 
-export const ListenerBuilder = () => {
-  throw new Error('Not yet implemented');
-};
+export { Listener } from './call-stream';
 
-export const InterceptorBuilder = () => {
-  throw new Error('Not yet implemented');
-};
+export {
+  Requester,
+  ListenerBuilder,
+  RequesterBuilder,
+  Interceptor,
+  InterceptorOptions,
+  InterceptorProvider,
+  InterceptingCall,
+  InterceptorConfigurationError,
+} from './client-interceptors';
 
-export const InterceptingCall = () => {
-  throw new Error('Not yet implemented');
-};
+export { GrpcObject } from './make-client';
+
+import * as resolver from './resolver';
+import * as load_balancer from './load-balancer';
+
+(() => {
+  resolver.registerAll();
+  load_balancer.registerAll();
+})();

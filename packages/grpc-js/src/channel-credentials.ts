@@ -15,11 +15,13 @@
  *
  */
 
-import {ConnectionOptions, createSecureContext, PeerCertificate} from 'tls';
+import { ConnectionOptions, createSecureContext, PeerCertificate } from 'tls';
 
-import {CallCredentials} from './call-credentials';
+import { CallCredentials } from './call-credentials';
+import { CIPHER_SUITES, getDefaultRootsData } from './tls-helpers';
+import { GoogleAuth as GoogleAuthType } from 'google-auth-library';
 
-// tslint:disable-next-line:no-any
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function verifyIsBufferOrNull(obj: any, friendlyName: string): void {
   if (obj && !(obj instanceof Buffer)) {
     throw new TypeError(`${friendlyName}, if provided, must be a Buffer.`);
@@ -42,8 +44,18 @@ export interface Certificate {
  * indicate that the presented certificate is considered invalid and
  * otherwise returned undefined.
  */
-export type CheckServerIdentityCallback =
-    (hostname: string, cert: Certificate) => Error|undefined;
+export type CheckServerIdentityCallback = (
+  hostname: string,
+  cert: Certificate
+) => Error | undefined;
+
+function bufferOrNullEqual(buf1: Buffer | null, buf2: Buffer | null) {
+  if (buf1 === null && buf2 === null) {
+    return true;
+  } else {
+    return buf1 !== null && buf2 !== null && buf1.equals(buf2);
+  }
+}
 
 /**
  * Additional peer verification options that can be set when creating
@@ -88,12 +100,19 @@ export abstract class ChannelCredentials {
    * instance was created with createSsl, or null if this instance was created
    * with createInsecure.
    */
-  abstract _getConnectionOptions(): ConnectionOptions|null;
+  abstract _getConnectionOptions(): ConnectionOptions | null;
 
   /**
    * Indicates whether this credentials object creates a secure channel.
    */
   abstract _isSecure(): boolean;
+
+  /**
+   * Check whether two channel credentials objects are equal. Two secure
+   * credentials are equal if they were constructed with the same parameters.
+   * @param other The other ChannelCredentials Object
+   */
+  abstract _equals(other: ChannelCredentials): boolean;
 
   /**
    * Return a new ChannelCredentials instance with a given set of credentials.
@@ -104,33 +123,30 @@ export abstract class ChannelCredentials {
    * @param certChain The client certificate key chain, if available.
    */
   static createSsl(
-      rootCerts?: Buffer|null, privateKey?: Buffer|null,
-      certChain?: Buffer|null,
-      verifyOptions?: VerifyOptions): ChannelCredentials {
+    rootCerts?: Buffer | null,
+    privateKey?: Buffer | null,
+    certChain?: Buffer | null,
+    verifyOptions?: VerifyOptions
+  ): ChannelCredentials {
     verifyIsBufferOrNull(rootCerts, 'Root certificate');
     verifyIsBufferOrNull(privateKey, 'Private key');
     verifyIsBufferOrNull(certChain, 'Certificate chain');
     if (privateKey && !certChain) {
       throw new Error(
-          'Private key must be given with accompanying certificate chain');
+        'Private key must be given with accompanying certificate chain'
+      );
     }
     if (!privateKey && certChain) {
       throw new Error(
-          'Certificate chain must be given with accompanying private key');
+        'Certificate chain must be given with accompanying private key'
+      );
     }
-    const secureContext = createSecureContext({
-      ca: rootCerts || undefined,
-      key: privateKey || undefined,
-      cert: certChain || undefined
-    });
-    const connectionOptions: ConnectionOptions = {secureContext};
-    if (verifyOptions && verifyOptions.checkServerIdentity) {
-      connectionOptions.checkServerIdentity =
-          (host: string, cert: PeerCertificate) => {
-            return verifyOptions.checkServerIdentity!(host, {raw: cert.raw});
-          };
-    }
-    return new SecureChannelCredentialsImpl(connectionOptions);
+    return new SecureChannelCredentialsImpl(
+      rootCerts || getDefaultRootsData(),
+      privateKey || null,
+      certChain || null,
+      verifyOptions || {}
+    );
   }
 
   /**
@@ -150,11 +166,14 @@ class InsecureChannelCredentialsImpl extends ChannelCredentials {
     throw new Error('Cannot compose insecure credentials');
   }
 
-  _getConnectionOptions(): ConnectionOptions|null {
+  _getConnectionOptions(): ConnectionOptions | null {
     return null;
   }
   _isSecure(): boolean {
     return false;
+  }
+  _equals(other: ChannelCredentials): boolean {
+    return other instanceof InsecureChannelCredentialsImpl;
   }
 }
 
@@ -162,22 +181,111 @@ class SecureChannelCredentialsImpl extends ChannelCredentials {
   connectionOptions: ConnectionOptions;
 
   constructor(
-      connectionOptions: ConnectionOptions, callCredentials?: CallCredentials) {
-    super(callCredentials);
-    this.connectionOptions = connectionOptions;
+    private rootCerts: Buffer | null,
+    private privateKey: Buffer | null,
+    private certChain: Buffer | null,
+    private verifyOptions: VerifyOptions
+  ) {
+    super();
+    const secureContext = createSecureContext({
+      ca: rootCerts || undefined,
+      key: privateKey || undefined,
+      cert: certChain || undefined,
+      ciphers: CIPHER_SUITES,
+    });
+    this.connectionOptions = { secureContext };
+    if (verifyOptions && verifyOptions.checkServerIdentity) {
+      this.connectionOptions.checkServerIdentity = (
+        host: string,
+        cert: PeerCertificate
+      ) => {
+        return verifyOptions.checkServerIdentity!(host, { raw: cert.raw });
+      };
+    }
   }
 
   compose(callCredentials: CallCredentials): ChannelCredentials {
-    const combinedCallCredentials =
-        this.callCredentials.compose(callCredentials);
-    return new SecureChannelCredentialsImpl(
-        this.connectionOptions, combinedCallCredentials);
+    const combinedCallCredentials = this.callCredentials.compose(
+      callCredentials
+    );
+    return new ComposedChannelCredentialsImpl(this, combinedCallCredentials);
   }
 
-  _getConnectionOptions(): ConnectionOptions|null {
-    return this.connectionOptions;
+  _getConnectionOptions(): ConnectionOptions | null {
+    // Copy to prevent callers from mutating this.connectionOptions
+    return { ...this.connectionOptions };
   }
   _isSecure(): boolean {
     return true;
   }
+  _equals(other: ChannelCredentials): boolean {
+    if (this === other) {
+      return true;
+    }
+    if (other instanceof SecureChannelCredentialsImpl) {
+      if (!bufferOrNullEqual(this.rootCerts, other.rootCerts)) {
+        return false;
+      }
+      if (!bufferOrNullEqual(this.privateKey, other.privateKey)) {
+        return false;
+      }
+      if (!bufferOrNullEqual(this.certChain, other.certChain)) {
+        return false;
+      }
+      return (
+        this.verifyOptions.checkServerIdentity ===
+        other.verifyOptions.checkServerIdentity
+      );
+    } else {
+      return false;
+    }
+  }
+}
+
+class ComposedChannelCredentialsImpl extends ChannelCredentials {
+  constructor(
+    private channelCredentials: SecureChannelCredentialsImpl,
+    callCreds: CallCredentials
+  ) {
+    super(callCreds);
+  }
+  compose(callCredentials: CallCredentials) {
+    const combinedCallCredentials = this.callCredentials.compose(
+      callCredentials
+    );
+    return new ComposedChannelCredentialsImpl(
+      this.channelCredentials,
+      combinedCallCredentials
+    );
+  }
+
+  _getConnectionOptions(): ConnectionOptions | null {
+    return this.channelCredentials._getConnectionOptions();
+  }
+  _isSecure(): boolean {
+    return true;
+  }
+  _equals(other: ChannelCredentials): boolean {
+    if (this === other) {
+      return true;
+    }
+    if (other instanceof ComposedChannelCredentialsImpl) {
+      return (
+        this.channelCredentials._equals(other.channelCredentials) &&
+        this.callCredentials._equals(other.callCredentials)
+      );
+    } else {
+      return false;
+    }
+  }
+}
+
+export function createGoogleDefaultCredentials(): ChannelCredentials {
+  const GoogleAuth = require('google-auth-library')
+    .GoogleAuth as typeof GoogleAuthType;
+  const sslCreds = ChannelCredentials.createSsl();
+  const googleAuthCreds = CallCredentials.createFromGoogleCredential(
+    new GoogleAuth()
+  );
+  return sslCreds.compose(googleAuthCreds);
 }

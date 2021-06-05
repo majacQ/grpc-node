@@ -42,7 +42,7 @@
     "through2": "^2.0.3",
     "ts-node": "^8.1.0",
     "tslint": "^5.5.0",
-    "typescript": "~3.3.3333",
+    "typescript": "^3.7.2",
     "xml2js": "^0.4.19"
   },
   "contributors": [
@@ -62,7 +62,7 @@
     "all": true
   },
   "scripts": {
-    "test": "nyc gulp test",
+    "test": "nyc gulp test && GRPC_DNS_RESOLVER=ares nyc gulp nativeTestOnly",
     "coverage": "nyc report --reporter=text-lcov | coveralls"
   }
 }

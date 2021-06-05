@@ -15,13 +15,23 @@
  *
  */
 
+import * as loader from '@grpc/proto-loader';
 import * as assert from 'assert';
+
+import { GrpcObject, loadPackageDefinition } from '../src/make-client';
+
+const protoLoaderOptions = {
+  keepCase: true,
+  longs: String,
+  enums: String,
+  defaults: true,
+  oneofs: true,
+};
 
 export function mockFunction(): never {
   throw new Error('Not implemented');
 }
 
-// tslint:disable-next-line:no-namespace
 export namespace assert2 {
   const toCall = new Map<() => void, number>();
   const afterCallsQueue: Array<() => void> = [];
@@ -38,7 +48,7 @@ export namespace assert2 {
       assert.throws(() => {
         throw e;
       });
-      throw e;  // for type safety only
+      throw e; // for type safety only
     }
   }
 
@@ -48,7 +58,7 @@ export namespace assert2 {
    */
   function mustCallsSatisfied(): boolean {
     let result = true;
-    toCall.forEach((value) => {
+    toCall.forEach(value => {
       result = result && value === 0;
     });
     return result;
@@ -63,8 +73,9 @@ export namespace assert2 {
    * @param fn The function to wrap.
    */
   // tslint:disable:no-any
-  export function mustCall<T>(fn: (...args: any[]) => T):
-      (...args: any[]) => T {
+  export function mustCall<T>(
+    fn: (...args: any[]) => T
+  ): (...args: any[]) => T {
     const existingValue = toCall.get(fn);
     if (existingValue !== undefined) {
       toCall.set(fn, existingValue + 1);
@@ -84,7 +95,6 @@ export namespace assert2 {
       return result;
     };
   }
-  // tslint:enable:no-any
 
   /**
    * Calls the given function when every function that was wrapped with
@@ -99,4 +109,9 @@ export namespace assert2 {
       fn();
     }
   }
+}
+
+export function loadProtoFile(file: string): GrpcObject {
+  const packageDefinition = loader.loadSync(file, protoLoaderOptions);
+  return loadPackageDefinition(packageDefinition);
 }

@@ -55,6 +55,9 @@ function handleError(call, error) {
     if (error.hasOwnProperty('details')) {
       status.details = error.details;
     }
+    if (status.code == constants.status.INTERNAL) {
+      common.log(constants.logVerbosity.ERROR, error);
+    }
   }
   if (error.hasOwnProperty('metadata')) {
     statusMetadata = error.metadata;
@@ -719,7 +722,8 @@ var streamHandlers = {
  * @memberof grpc
  * @constructor
  * @param {Object=} options Options that should be passed to the internal server
- *     implementation
+ *     implementation. The available options are listed in
+ *     [this document]{@link https://grpc.github.io/grpc/core/group__grpc__arg__keys.html}.
  * @example
  * var server = new grpc.Server();
  * server.addProtoService(protobuf_service_descriptor, service_implementation);
@@ -772,7 +776,7 @@ Server.prototype.start = function() {
       batch[grpc.opType.SEND_STATUS_FROM_SERVER] = {
         code: constants.status.UNIMPLEMENTED,
         details: 'RPC method not implemented ' + method,
-        metadata: {}
+        metadata: (new Metadata())._getCoreRepresentation()
       };
       batch[grpc.opType.RECV_CLOSE_ON_SERVER] = true;
       call.startBatch(batch, function() {});
@@ -839,25 +843,34 @@ Server.prototype.forceShutdown = function() {
   this._server.forceShutdown();
 };
 
-var unimplementedStatusResponse = {
-  code: constants.status.UNIMPLEMENTED,
-  details: 'The server does not implement this method'
-};
-
-var defaultHandler = {
-  unary: function(call, callback) {
-    callback(unimplementedStatusResponse);
-  },
-  client_stream: function(call, callback) {
-    callback(unimplementedStatusResponse);
-  },
-  server_stream: function(call) {
-    call.emit('error', unimplementedStatusResponse);
-  },
-  bidi: function(call) {
-    call.emit('error', unimplementedStatusResponse);
+function getUnimplementedStatusResponse(methodName) {
+  return {
+    code: constants.status.UNIMPLEMENTED,
+    details: 'The server does not implement the method' + methodName
   }
-};
+}
+
+function getDefaultHandler(handlerType, methodName) {
+  const unimplementedStatusResponse = getUnimplementedStatusResponse(methodName);
+  switch(handlerType) {
+    case 'unary':
+      return (call, callback) => {
+        callback(unimplementedStatusResponse, null);
+      };
+    case 'client_stream':
+      return (call,callback) => {
+        callback(unimplementedStatusResponse, null);
+      };
+    case 'server_stream':
+      return (call) => {
+        call.emit('error', unimplementedStatusResponse);
+      }
+    case 'bidi':
+      return (call) => {
+        call.emit('error', unimplementedStatusResponse);
+      }
+  }
+}
 
 function isObject(thing) {
   return (typeof thing === 'object' || typeof thing === 'function') && thing !== null;
@@ -904,7 +917,7 @@ Server.prototype.addService = function(service, implementation) {
       if (implementation[attrs.originalName] === undefined) {
         common.log(constants.logVerbosity.ERROR, 'Method handler ' + name +
             ' for ' + attrs.path + ' expected but not provided');
-        impl = defaultHandler[method_type];
+        impl = getDefaultHandler(method_type, name);
       } else {
         impl = implementation[attrs.originalName].bind(implementation);
       }
@@ -957,7 +970,7 @@ Server.prototype.addProtoService = util.deprecate(function(service,
  *     "address:port"
  * @param {grpc.ServerCredentials} creds Server credential object to be used for
  *     SSL. Pass an insecure credentials object for an insecure port.
- * @return {number} The bound port number. Negative if binding the port failed.
+ * @return {number} The bound port number. Zero if binding the port failed.
  */
 Server.prototype.bind = function(port, creds) {
   if (this.started) {
@@ -971,7 +984,7 @@ Server.prototype.bind = function(port, creds) {
  * @callback grpc.Server~bindCallback
  * @param {Error=} error If non-null, indicates that binding the port failed.
  * @param {number} port The bound port number. If binding the port fails, this
- *     will be negative to match the output of bind.
+ *     will be zero to match the output of bind.
  */
 
 /**
@@ -987,7 +1000,7 @@ Server.prototype.bindAsync = function(port, creds, callback) {
    * incorrect use of the function, which should not be surfaced asynchronously
    */
   const result = this.bind(port, creds)
-  if (result < 0) {
+  if (result === 0) {
     setImmediate(callback, new Error('Failed to bind port'), result);
   } else {
     setImmediate(callback, null, result);

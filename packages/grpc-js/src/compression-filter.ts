@@ -17,10 +17,10 @@
 
 import * as zlib from 'zlib';
 
-import {Call, WriteFlags, WriteObject} from './call-stream';
-import {Channel} from './channel';
-import {BaseFilter, Filter, FilterFactory} from './filter';
-import {Metadata, MetadataValue} from './metadata';
+import { Call, WriteFlags, WriteObject } from './call-stream';
+import { Channel } from './channel';
+import { BaseFilter, Filter, FilterFactory } from './filter';
+import { Metadata, MetadataValue } from './metadata';
 
 abstract class CompressionHandler {
   protected abstract compressMessage(message: Buffer): Promise<Buffer>;
@@ -71,8 +71,11 @@ class IdentityHandler extends CompressionHandler {
   }
 
   decompressMessage(message: Buffer): Promise<Buffer> {
-    return Promise.reject<Buffer>(new Error(
-        'Received compressed message but "grpc-encoding" header was identity'));
+    return Promise.reject<Buffer>(
+      new Error(
+        'Received compressed message but "grpc-encoding" header was identity'
+      )
+    );
   }
 }
 
@@ -133,15 +136,18 @@ class UnknownHandler extends CompressionHandler {
     super();
   }
   compressMessage(message: Buffer): Promise<Buffer> {
-    return Promise.reject<Buffer>(new Error(
-        `Received message compressed wth unsupported compression method ${
-            this.compressionName}`));
+    return Promise.reject<Buffer>(
+      new Error(
+        `Received message compressed with unsupported compression method ${this.compressionName}`
+      )
+    );
   }
 
   decompressMessage(message: Buffer): Promise<Buffer> {
     // This should be unreachable
     return Promise.reject<Buffer>(
-        new Error(`Compression method not supported: ${this.compressionName}`));
+      new Error(`Compression method not supported: ${this.compressionName}`)
+    );
   }
 }
 
@@ -163,23 +169,22 @@ export class CompressionFilter extends BaseFilter implements Filter {
   private receiveCompression: CompressionHandler = new IdentityHandler();
   async sendMetadata(metadata: Promise<Metadata>): Promise<Metadata> {
     const headers: Metadata = await metadata;
-    headers.set('grpc-encoding', 'identity');
     headers.set('grpc-accept-encoding', 'identity,deflate,gzip');
+    headers.set('accept-encoding', 'identity,gzip');
     return headers;
   }
 
-  async receiveMetadata(metadata: Promise<Metadata>): Promise<Metadata> {
-    const headers: Metadata = await metadata;
-    const receiveEncoding: MetadataValue[] = headers.get('grpc-encoding');
+  receiveMetadata(metadata: Metadata): Metadata {
+    const receiveEncoding: MetadataValue[] = metadata.get('grpc-encoding');
     if (receiveEncoding.length > 0) {
       const encoding: MetadataValue = receiveEncoding[0];
       if (typeof encoding === 'string') {
         this.receiveCompression = getCompressionHandler(encoding);
       }
     }
-    headers.remove('grpc-encoding');
-    headers.remove('grpc-accept-encoding');
-    return headers;
+    metadata.remove('grpc-encoding');
+    metadata.remove('grpc-accept-encoding');
+    return metadata;
   }
 
   async sendMessage(message: Promise<WriteObject>): Promise<WriteObject> {
@@ -187,13 +192,16 @@ export class CompressionFilter extends BaseFilter implements Filter {
      * and the output is a framed and possibly compressed message. For this
      * reason, this filter should be at the bottom of the filter stack */
     const resolvedMessage: WriteObject = await message;
-    const compress = resolvedMessage.flags === undefined ?
-        false :
-        (resolvedMessage.flags & WriteFlags.NoCompress) === 0;
+    const compress =
+      resolvedMessage.flags === undefined
+        ? false
+        : (resolvedMessage.flags & WriteFlags.NoCompress) === 0;
     return {
       message: await this.sendCompression.writeMessage(
-          resolvedMessage.message, compress),
-      flags: resolvedMessage.flags
+        resolvedMessage.message,
+        compress
+      ),
+      flags: resolvedMessage.flags,
     };
   }
 
@@ -206,8 +214,8 @@ export class CompressionFilter extends BaseFilter implements Filter {
   }
 }
 
-export class CompressionFilterFactory implements
-    FilterFactory<CompressionFilter> {
+export class CompressionFilterFactory
+  implements FilterFactory<CompressionFilter> {
   constructor(private readonly channel: Channel) {}
   createFilter(callStream: Call): CompressionFilter {
     return new CompressionFilter();

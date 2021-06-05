@@ -20,15 +20,14 @@ SET PATH=%APPDATA%\nvm-ps;%APPDATA%\nvm-ps\nodejs;%PATH%
 call nvm install 10
 call nvm use 10
 
-call npm install -g npm
+call npm install -g npm@6.10.x
 @rem https://github.com/mapbox/node-pre-gyp/issues/362
-call npm install -g node-gyp
+call npm install -g node-gyp@3
 
 cd /d %~dp0
 cd ..\..
 
-git submodule update --init
-git submodule foreach --recursive git submodule update --init
+git submodule update --init --recursive
 
 set ARTIFACTS_OUT=%cd%\artifacts
 cd packages\grpc-native-core

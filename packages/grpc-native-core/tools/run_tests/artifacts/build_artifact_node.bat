@@ -14,7 +14,7 @@
 
 set arch_list=ia32 x64
 
-set node_versions=4.0.0 5.0.0 6.0.0 7.0.0 8.0.0 9.0.0 10.0.0 11.0.0 12.0.0
+set node_versions=4.0.0 5.0.0 6.0.0 7.0.0 8.0.0 9.0.0 10.0.0 11.0.0 12.0.0 13.0.0
 
 set PATH=%PATH%;C:\Program Files\nodejs\;%APPDATA%\npm
 
@@ -33,6 +33,8 @@ for %%a in (%arch_list%) do (
   @rem Try again after removing openssl headers
     rmdir "%USERPROFILE%\.node-gyp\%%v\include\node\openssl" /S /Q
     rmdir "%USERPROFILE%\.node-gyp\iojs-%%v\include\node\openssl" /S /Q
+    rmdir "%USERPROFILE%\AppData\Local\node-gyp\cache\%%v\include\node\openssl" /S /Q
+    rmdir "%USERPROFILE%\AppData\Local\node-gyp\cache\iojs-%%v\include\node\openssl" /S /Q
     call .\node_modules\.bin\node-pre-gyp.cmd build package --target=%%v --target_arch=%%a || goto :error
 
     xcopy /Y /I /S build\stage\* %ARTIFACTS_OUT%\ || goto :error
