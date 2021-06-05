@@ -15,32 +15,52 @@
 SET ROOT=%~dp0
 cd /d %~dp0
 
-PowerShell -Command .\install-nvm-windows.ps1
+powershell -c "Get-Host"
+powershell -c "$PSVersionTable"
+powershell -c "[System.Environment]::OSVersion"
+powershell -c "Get-WmiObject -Class Win32_ComputerSystem"
+powershell -c "(Get-WmiObject -Class Win32_ComputerSystem).SystemType"
 
-SET NVM_HOME=%ROOT%nvm
-SET NVM_SYMLINK=%ROOT%nvm\nodejs
-SET PATH=%NVM_HOME%;%NVM_SYMLINK%;%PATH%
+powershell -c "& { iwr https://raw.githubusercontent.com/grumpycoders/nvm-ps/master/nvm.ps1 | iex }"
 
-nvm version
+SET PATH=%APPDATA%\nvm-ps;%APPDATA%\nvm-ps\nodejs;%PATH%
+SET JOBS=8
 
-nvm install 8.5.0
-nvm use 8.5.0
+call nvm version
+
+call nvm install 8
+call nvm use 8
+
+SET npm_config_fetch_retries=5
 
 call npm install || goto :error
 
-for %%v in (4.8.4 6.11.3 7.9.0 8.5.0) do (
-  nvm install %%v
-  nvm use %%v
-  npm install -g npm
+SET JUNIT_REPORT_STACK=1
+SET FAILED=0
+
+for %%v in (8 10 12) do (
+  call nvm install %%v
+  call nvm use %%v
+  if "%%v"=="4" (
+    call npm install -g npm@5
+  )
+  @rem https://github.com/mapbox/node-pre-gyp/issues/362
+  call npm install -g node-gyp
   node -e "console.log(process.versions)"
 
-  call .\node_modules\.bin\gulp clean.all || goto :error
-  call .\node_modules\.bin\gulp setup.windows || goto :error
-  call .\node_modules\.bin\gulp native.test || goto :error
+  mkdir reports\node%%v
+  SET JUNIT_REPORT_PATH=reports/node%%v
+
+  node -e "process.exit(process.version.startsWith('v%%v') ? 0 : -1)" || goto :error
+
+  call .\node_modules\.bin\gulp cleanAll || SET FAILED=1
+  call .\node_modules\.bin\gulp setup || SET FAILED=1
+  call .\node_modules\.bin\gulp test || SET FAILED=1
+  cmd.exe /c "SET GRPC_DNS_RESOLVER=ares& call .\node_modules\.bin\gulp nativeTestOnly" || SET FAILED=1
 )
 
-if %errorlevel% neq 0 exit /b %errorlevel%
-
+node merge_kokoro_logs.js
+if %FAILED% neq 0 exit /b 1
 goto :EOF
 
 :error

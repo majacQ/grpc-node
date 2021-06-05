@@ -20,11 +20,17 @@
 
 var fs = require('fs');
 var path = require('path');
-var grpc = require('../any_grpc')['$implementationInfo'].client.surface;
-var testProto = grpc.load({
-  root: __dirname + '/../../packages/grpc-native-core/deps/grpc',
-  file: 'src/proto/grpc/testing/test.proto'}).grpc.testing;
+var grpc = require('../any_grpc').client;
+var protoLoader = require('../../packages/proto-loader');
 var GoogleAuth = require('google-auth-library');
+
+var protoPackage = protoLoader.loadSync(
+    'src/proto/grpc/testing/test.proto',
+    {keepCase: true,
+     defaults: true,
+     enums: String,
+     includeDirs: [__dirname + '/../proto/']});
+var testProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 var assert = require('assert');
 
@@ -43,10 +49,10 @@ var ECHO_TRAILING_KEY = 'x-grpc-test-echo-trailing-bin';
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }
@@ -288,7 +294,7 @@ function customMetadata(client, done) {
   done = multiDone(done, 5);
   var metadata = new grpc.Metadata();
   metadata.set(ECHO_INITIAL_KEY, 'test_initial_metadata_value');
-  metadata.set(ECHO_TRAILING_KEY, new Buffer('ababab', 'hex'));
+  metadata.set(ECHO_TRAILING_KEY, Buffer.from('ababab', 'hex'));
   var arg = {
     response_type: 'COMPRESSABLE',
     response_size: 314159,
@@ -361,6 +367,22 @@ function statusCodeAndMessage(client, done) {
   duplex.on('error', function(){});
   duplex.write(arg);
   duplex.end();
+}
+
+function specialStatusMessage(client, done) {
+  let expectedMessage = '\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n';
+  let arg = {
+    response_status: {
+      code: 2,
+      message: expectedMessage
+    }
+  };
+  client.unaryCall(arg, function(err, resp) {
+    assert(err);
+    assert.strictEqual(err.code, 2);
+    assert.strictEqual(err.details, expectedMessage);
+    done();
+  });
 }
 
 // NOTE: the client param to this function is from UnimplementedService
@@ -524,6 +546,8 @@ var test_cases = {
                     Client: testProto.TestService},
   status_code_and_message: {run: statusCodeAndMessage,
                             Client: testProto.TestService},
+  special_status_message: {run: specialStatusMessage,
+                           Client: testProto.TestService},
   unimplemented_service: {run: unimplementedService,
                          Client: testProto.UnimplementedService},
   unimplemented_method: {run: unimplementedMethod,
@@ -610,8 +634,12 @@ if (require.main === module) {
   };
   runTest(argv.server_host + ':' + argv.server_port, argv.server_host_override,
           argv.test_case, argv.use_tls === 'true', argv.use_test_ca === 'true',
-          function () {
-            console.log('OK:', argv.test_case);
+          function (err) {
+            if (err) {
+              throw err;
+            } else {
+              console.log('OK:', argv.test_case);
+            }
           }, extra_args);
 }
 

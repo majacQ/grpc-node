@@ -23,6 +23,7 @@
 
 'use strict';
 
+var assert = require('assert');
 var fs = require('fs');
 var path = require('path');
 var EventEmitter = require('events');
@@ -30,19 +31,24 @@ var util = require('util');
 
 var genericService = require('./generic_service');
 
-// TODO(murgatroid99): use multiple grpc implementations
-var grpc = require('grpc');
-var serviceProto = grpc.load({
-  root: __dirname + '/../packages/grpc-native-core/ext/grpc',
-  file: 'src/proto/grpc/testing/services.proto'}).grpc.testing;
+var grpc = require('../any_grpc').server;
+var protoLoader = require('../../packages/proto-loader');
+var protoPackage = protoLoader.loadSync(
+    'src/proto/grpc/testing/benchmark_service.proto',
+    {keepCase: true,
+     defaults: true,
+     enums: String,
+     oneofs: true,
+     includeDirs: [__dirname + '/../proto']});
+var serviceProto = grpc.loadPackageDefinition(protoPackage).grpc.testing;
 
 /**
  * Create a buffer filled with size zeroes
  * @param {number} size The length of the buffer
- * @return {Buffer} The new buffer
+ * @return {Buffer} The New Buffer
  */
 function zeroBuffer(size) {
-  var zeros = new Buffer(size);
+  var zeros = Buffer.alloc(size);
   zeros.fill(0);
   return zeros;
 }
@@ -106,8 +112,8 @@ function BenchmarkServer(host, port, tls, generic, response_size) {
   var server_creds;
   var host_override;
   if (tls) {
-    var key_path = path.join(__dirname, '../test/data/server1.key');
-    var pem_path = path.join(__dirname, '../test/data/server1.pem');
+    var key_path = path.join(__dirname, '../data/server1.key');
+    var pem_path = path.join(__dirname, '../data/server1.pem');
 
     var key_data = fs.readFileSync(key_path);
     var pem_data = fs.readFileSync(pem_path);
@@ -124,7 +130,7 @@ function BenchmarkServer(host, port, tls, generic, response_size) {
   };
 
   var server = new grpc.Server(options);
-  this.port = server.bind(host + ':' + port, server_creds);
+
   if (generic) {
     server.addService(genericService, {
       unaryCall: makeUnaryGenericCall(response_size),
@@ -137,6 +143,9 @@ function BenchmarkServer(host, port, tls, generic, response_size) {
     });
   }
   this.server = server;
+  this.host = host;
+  this.port = port;
+  this.creds = server_creds;
 }
 
 util.inherits(BenchmarkServer, EventEmitter);
@@ -145,10 +154,13 @@ util.inherits(BenchmarkServer, EventEmitter);
  * Start the benchmark server.
  */
 BenchmarkServer.prototype.start = function() {
-  this.server.start();
-  this.last_wall_time = process.hrtime();
-  this.last_usage = process.cpuUsage();
-  this.emit('started');
+  this.server.bindAsync(this.host + ':' + this.port, this.creds, (err) => {
+    assert.ifError(err);
+    this.server.start();
+    this.last_wall_time = process.hrtime();
+    this.last_usage = process.cpuUsage();
+    this.emit('started');
+  });
 };
 
 /**
