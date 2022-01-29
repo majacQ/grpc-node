@@ -59,7 +59,7 @@
   "dependencies": {
     "@types/node": ">=12.12.47",
     "google-auth-library": "^6.1.1",
-    "semver": "^6.2.0"
+    "semver": "^7.3.5"
   },
   "files": [
     "src/**/*.ts",
